@@ -1,13 +1,20 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import axios from "axios";
 import Modal from "./modal/Modal";
 import { UrlInput } from "./modal/UrlInput";
 import AudioPlayer from "./AudioPlayer";
 import { TranscribeButton } from "./TranscribeButton";
 import Constants from "../utils/Constants";
-import { Transcriber } from "../hooks/useTranscriber";
+import { Chunk, Engine, Transcriber } from "../hooks/useTranscriber";
 import Progress from "./Progress";
 import AudioRecorder from "./AudioRecorder";
+import { formatAudioTimestamp } from "../utils/AudioUtils";
+import { exportAll } from "../utils/ExportUtils";
+import {
+    checkApiHealth,
+    fetchApiModels,
+    ApiModelOption,
+} from "../utils/ApiClient";
 
 function titleCase(str: string) {
     str = str.toLowerCase();
@@ -129,27 +136,185 @@ export enum AudioSource {
     RECORDING = "RECORDING",
 }
 
-export function AudioManager(props: { transcriber: Transcriber }) {
+interface AudioItem {
+    id: string;
+    /** File name, or the path relative to the picked folder. */
+    name: string;
+    buffer: AudioBuffer;
+    url: string;
+    source: AudioSource;
+    mimeType: string;
+    /** Original file, kept so the API engine can upload it untouched. */
+    file?: Blob;
+    status: "pending" | "done" | "error";
+    result?: { text: string; chunks: Chunk[] };
+}
+
+const AUDIO_EXTENSION =
+    /\.(mp3|wav|m4a|aac|ogg|oga|opus|flac|weba|webm|mp4|mpeg|mpga|aiff|aif|wma)$/i;
+
+function isProbablyAudio(file: File) {
+    return (
+        file.type.startsWith("audio/") ||
+        file.type.startsWith("video/") ||
+        AUDIO_EXTENSION.test(file.name)
+    );
+}
+
+let idCounter = 0;
+function makeId(prefix: string) {
+    return `${prefix}-${Date.now()}-${idCounter++}`;
+}
+
+function nameFromUrl(url: string) {
+    try {
+        const path = new URL(url).pathname;
+        return decodeURIComponent(path.split("/").pop() || "audio");
+    } catch (e) {
+        return "audio";
+    }
+}
+
+export function AudioManager(props: {
+    transcriber: Transcriber;
+    onSelectedFileChange?: (name: string | undefined) => void;
+}) {
     const [progress, setProgress] = useState<number | undefined>(undefined);
-    const [audioData, setAudioData] = useState<
-        | {
-              buffer: AudioBuffer;
-              url: string;
-              source: AudioSource;
-              mimeType: string;
-          }
-        | undefined
+    const [items, setItems] = useState<AudioItem[]>([]);
+    const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
+    const [batch, setBatch] = useState<
+        { index: number; total: number } | undefined
     >(undefined);
     const [audioDownloadUrl, setAudioDownloadUrl] = useState<
         string | undefined
     >(undefined);
 
+    const itemsRef = useRef<AudioItem[]>([]);
+    const selectedIdRef = useRef<string | undefined>(undefined);
+    const batchRef = useRef<{ running: boolean; index: number } | undefined>(
+        undefined,
+    );
+    const lastOutputRef = useRef<unknown>(undefined);
+
+    useEffect(() => {
+        itemsRef.current = items;
+    }, [items]);
+    useEffect(() => {
+        selectedIdRef.current = selectedId;
+    }, [selectedId]);
+
+    const audioData = items.find((item) => item.id === selectedId);
     const isAudioLoading = progress !== undefined;
 
+    const updateItems = useCallback(
+        (updater: (prev: AudioItem[]) => AudioItem[]) => {
+            setItems((prev) => {
+                const next = updater(prev);
+                const ids = new Set(next.map((item) => item.id));
+                prev.forEach((item) => {
+                    if (!ids.has(item.id)) URL.revokeObjectURL(item.url);
+                });
+                return next;
+            });
+        },
+        [],
+    );
+
     const resetAudio = () => {
-        setAudioData(undefined);
-        setAudioDownloadUrl(undefined);
+        batchRef.current = undefined;
+        lastOutputRef.current = undefined;
+        setBatch(undefined);
+        setSelectedId(undefined);
+        selectedIdRef.current = undefined;
+        updateItems(() => []);
+        props.transcriber.onInputChange();
+        props.onSelectedFileChange?.(undefined);
     };
+
+    const selectItem = (id: string) => {
+        if (props.transcriber.isBusy) return;
+        setSelectedId(id);
+        selectedIdRef.current = id;
+        const item = itemsRef.current.find((i) => i.id === id);
+        if (item?.result) {
+            lastOutputRef.current = undefined;
+            props.transcriber.setOutput({
+                isBusy: false,
+                text: item.result.text,
+                chunks: item.result.chunks,
+            });
+        } else {
+            props.transcriber.onInputChange();
+        }
+        props.onSelectedFileChange?.(item?.name);
+    };
+
+    const addSingle = (item: AudioItem) => {
+        batchRef.current = undefined;
+        lastOutputRef.current = undefined;
+        setBatch(undefined);
+        updateItems(() => [item]);
+        setSelectedId(item.id);
+        selectedIdRef.current = item.id;
+        props.onSelectedFileChange?.(item.name);
+    };
+
+    const startTranscribe = (item: AudioItem) => {
+        lastOutputRef.current = undefined;
+        props.transcriber.start(item.buffer, item.file, item.name);
+    };
+
+    // Handle a finished transcription: store the result and (in batch mode)
+    // move on to the next file.
+    useEffect(() => {
+        const output = props.transcriber.output;
+        if (!output || output.isBusy || props.transcriber.isBusy) return;
+        if (lastOutputRef.current === output) return;
+        lastOutputRef.current = output;
+
+        const result = { text: output.text, chunks: output.chunks };
+        const currentBatch = batchRef.current;
+
+        if (currentBatch && currentBatch.running) {
+            const list = itemsRef.current.filter(
+                (item) => item.status !== "error",
+            );
+            const current = list[currentBatch.index];
+            if (current) {
+                updateItems((prev) =>
+                    prev.map((item) =>
+                        item.id === current.id
+                            ? { ...item, status: "done", result }
+                            : item,
+                    ),
+                );
+            }
+            const next = currentBatch.index + 1;
+            if (next < list.length) {
+                currentBatch.index = next;
+                setBatch({ index: next, total: list.length });
+                setSelectedId(list[next].id);
+                selectedIdRef.current = list[next].id;
+                props.onSelectedFileChange?.(list[next].name);
+                startTranscribe(list[next]);
+            } else {
+                batchRef.current = undefined;
+                setBatch(undefined);
+            }
+        } else {
+            const id = selectedIdRef.current;
+            if (id) {
+                updateItems((prev) =>
+                    prev.map((item) =>
+                        item.id === id
+                            ? { ...item, status: "done", result }
+                            : item,
+                    ),
+                );
+            }
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [props.transcriber.output, props.transcriber.isBusy]);
 
     const setAudioFromDownload = async (
         data: ArrayBuffer,
@@ -162,16 +327,18 @@ export function AudioManager(props: { transcriber: Transcriber }) {
             new Blob([data], { type: "audio/*" }),
         );
         const decoded = await audioCTX.decodeAudioData(data);
-        setAudioData({
+        addSingle({
+            id: makeId("url"),
+            name: nameFromUrl(audioDownloadUrl ?? ""),
             buffer: decoded,
             url: blobUrl,
             source: AudioSource.URL,
             mimeType: mimeType,
+            status: "pending",
         });
     };
 
     const setAudioFromRecording = async (data: Blob) => {
-        resetAudio();
         setProgress(0);
         const blobUrl = URL.createObjectURL(data);
         const fileReader = new FileReader();
@@ -185,14 +352,86 @@ export function AudioManager(props: { transcriber: Transcriber }) {
             const arrayBuffer = fileReader.result as ArrayBuffer;
             const decoded = await audioCTX.decodeAudioData(arrayBuffer);
             setProgress(undefined);
-            setAudioData({
+            addSingle({
+                id: makeId("recording"),
+                name: `recording-${new Date()
+                    .toISOString()
+                    .replace(/[:.]/g, "-")}.wav`,
                 buffer: decoded,
                 url: blobUrl,
                 source: AudioSource.RECORDING,
                 mimeType: data.type,
+                file: data,
+                status: "pending",
             });
         };
         fileReader.readAsArrayBuffer(data);
+    };
+
+    const handleFiles = async (files: File[]) => {
+        const candidates = files.filter(isProbablyAudio);
+        if (candidates.length === 0) {
+            alert("没有找到可解码的音频文件。");
+            return;
+        }
+
+        batchRef.current = undefined;
+        lastOutputRef.current = undefined;
+        setBatch(undefined);
+        props.transcriber.onInputChange();
+
+        setProgress(0);
+        const audioCTX = new AudioContext({
+            sampleRate: Constants.SAMPLING_RATE,
+        });
+        const decodedItems: AudioItem[] = [];
+
+        for (let i = 0; i < candidates.length; ++i) {
+            const file = candidates[i];
+            setProgress(i / candidates.length);
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                const decoded = await audioCTX.decodeAudioData(arrayBuffer);
+                decodedItems.push({
+                    id: makeId("file"),
+                    name:
+                        (file as File & { webkitRelativePath?: string })
+                            .webkitRelativePath || file.name,
+                    buffer: decoded,
+                    url: URL.createObjectURL(file),
+                    source: AudioSource.FILE,
+                    mimeType: file.type || "audio/*",
+                    file: file,
+                    status: "pending",
+                });
+            } catch (error) {
+                console.warn(`Failed to decode "${file.name}"`, error);
+            }
+        }
+        setProgress(undefined);
+
+        if (decodedItems.length === 0) {
+            alert("所选文件都无法解码，请检查格式是否为浏览器支持的音频。");
+            return;
+        }
+
+        updateItems((prev) => [...prev, ...decodedItems]);
+        setSelectedId((current) => current ?? decodedItems[0].id);
+        if (!selectedIdRef.current) {
+            selectedIdRef.current = decodedItems[0].id;
+            props.onSelectedFileChange?.(decodedItems[0].name);
+        }
+    };
+
+    const removeItem = (id: string) => {
+        if (props.transcriber.isBusy) return;
+        updateItems((prev) => prev.filter((item) => item.id !== id));
+        if (selectedId === id) {
+            setSelectedId(undefined);
+            selectedIdRef.current = undefined;
+            props.transcriber.onInputChange();
+            props.onSelectedFileChange?.(undefined);
+        }
     };
 
     const downloadAudioFromUrl = async (
@@ -200,7 +439,6 @@ export function AudioManager(props: { transcriber: Transcriber }) {
     ) => {
         if (audioDownloadUrl) {
             try {
-                setAudioData(undefined);
                 setProgress(0);
                 const { data, headers } = (await axios.get(audioDownloadUrl, {
                     signal: requestAbortController.signal,
@@ -237,6 +475,61 @@ export function AudioManager(props: { transcriber: Transcriber }) {
         }
     }, [audioDownloadUrl]);
 
+    const onTranscribeClick = () => {
+        const list = items.filter((item) => item.status !== "error");
+        if (list.length === 0) return;
+
+        if (list.length === 1) {
+            startTranscribe(list[0]);
+            return;
+        }
+
+        // Batch mode: transcribe every file one after another
+        batchRef.current = { running: true, index: 0 };
+        setBatch({ index: 0, total: list.length });
+        setSelectedId(list[0].id);
+        selectedIdRef.current = list[0].id;
+        props.onSelectedFileChange?.(list[0].name);
+        startTranscribe(list[0]);
+    };
+
+    const doneItems = items.filter((item) => item.result);
+
+    const exportAllAs = (format: "json" | "txt" | "srt") => {
+        exportAll(
+            doneItems.map((item) => ({
+                name: item.name,
+                chunks: item.result?.chunks ?? [],
+            })),
+            format,
+        );
+    };
+
+    const transcribeProgress = props.transcriber.output?.progress;
+    const uploadProgress = props.transcriber.uploadProgress;
+    // "browser" runs the model in a web worker, everything else talks to the
+    // Node API (either the server's local engine or an OpenAI compatible one).
+    const usesServer = props.transcriber.engine !== "browser";
+    const progressValue = usesServer
+        ? uploadProgress
+        : transcribeProgress?.value;
+
+    let progressText = "";
+    if (props.transcriber.isModelLoading) {
+        progressText = "Loading model files... (only run once)";
+    } else if (usesServer) {
+        progressText =
+            uploadProgress !== undefined && uploadProgress < 1
+                ? `Uploading... ${Math.round(uploadProgress * 100)}%`
+                : "Transcribing on the server...";
+    } else if (transcribeProgress) {
+        progressText = `${formatAudioTimestamp(
+            transcribeProgress.processed,
+        )} / ${formatAudioTimestamp(transcribeProgress.total)} · chunk ${
+            transcribeProgress.chunksDone
+        }/${transcribeProgress.chunksTotal}`;
+    }
+
     return (
         <>
             <div className='flex flex-col justify-center items-center rounded-lg bg-white shadow-xl shadow-black/5 ring-1 ring-slate-700/10'>
@@ -253,14 +546,9 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                     <FileTile
                         icon={<FolderIcon />}
                         text={"From file"}
-                        onFileUpdate={(decoded, blobUrl, mimeType) => {
+                        onFilesUpdate={(files) => {
                             props.transcriber.onInputChange();
-                            setAudioData({
-                                buffer: decoded,
-                                url: blobUrl,
-                                source: AudioSource.FILE,
-                                mimeType: mimeType,
-                            });
+                            handleFiles(files);
                         }}
                     />
                     {navigator.mediaDevices && (
@@ -276,6 +564,16 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                             />
                         </>
                     )}
+                    {items.length > 0 && (
+                        <>
+                            <VerticalBar />
+                            <Tile
+                                icon={<TrashIcon />}
+                                text={"Clear"}
+                                onClick={resetAudio}
+                            />
+                        </>
+                    )}
                 </div>
                 {
                     <AudioDataBar
@@ -283,6 +581,81 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                     />
                 }
             </div>
+
+            {items.length > 1 && (
+                <div className='w-full mt-2 p-2 bg-white shadow-xl shadow-black/5 ring-1 ring-slate-700/10 rounded-lg'>
+                    <div className='flex flex-wrap justify-between items-center px-2 pb-2 text-sm text-slate-600'>
+                        <span>
+                            {items.length} files · {doneItems.length}{" "}
+                            transcribed
+                        </span>
+                        <span className='flex space-x-2'>
+                            <button
+                                disabled={doneItems.length === 0}
+                                onClick={() => exportAllAs("json")}
+                                className='text-white bg-green-500 hover:bg-green-600 disabled:bg-gray-300 font-medium rounded-lg text-xs px-3 py-1.5'
+                            >
+                                Export All JSON
+                            </button>
+                            <button
+                                disabled={doneItems.length === 0}
+                                onClick={() => exportAllAs("txt")}
+                                className='text-white bg-green-500 hover:bg-green-600 disabled:bg-gray-300 font-medium rounded-lg text-xs px-3 py-1.5'
+                            >
+                                Export All TXT
+                            </button>
+                            <button
+                                disabled={doneItems.length === 0}
+                                onClick={() => exportAllAs("srt")}
+                                className='text-white bg-green-500 hover:bg-green-600 disabled:bg-gray-300 font-medium rounded-lg text-xs px-3 py-1.5'
+                            >
+                                Export All SRT
+                            </button>
+                        </span>
+                    </div>
+                    <ul className='max-h-48 overflow-y-auto divide-y divide-slate-100'>
+                        {items.map((item, index) => (
+                            <li
+                                key={item.id}
+                                onClick={() => selectItem(item.id)}
+                                className={`flex items-center justify-between px-2 py-1.5 text-sm cursor-pointer hover:bg-indigo-50 ${
+                                    item.id === selectedId ? "bg-indigo-50" : ""
+                                }`}
+                            >
+                                <span className='truncate flex-1'>
+                                    {item.name}
+                                </span>
+                                <span className='text-xs text-slate-400 ml-2'>
+                                    {formatAudioTimestamp(item.buffer.duration)}
+                                </span>
+                                <span
+                                    className={`text-xs ml-2 w-16 text-right ${
+                                        item.status === "done"
+                                            ? "text-green-600"
+                                            : "text-slate-400"
+                                    }`}
+                                >
+                                    {batch && batch.index === index
+                                        ? "running"
+                                        : item.status === "done"
+                                        ? "done"
+                                        : "pending"}
+                                </span>
+                                <button
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        removeItem(item.id);
+                                    }}
+                                    className='ml-2 px-1 text-slate-300 hover:text-red-500'
+                                >
+                                    ×
+                                </button>
+                            </li>
+                        ))}
+                    </ul>
+                </div>
+            )}
+
             {audioData && (
                 <>
                     <AudioPlayer
@@ -292,12 +665,16 @@ export function AudioManager(props: { transcriber: Transcriber }) {
 
                     <div className='relative w-full flex justify-center items-center'>
                         <TranscribeButton
-                            onClick={() => {
-                                props.transcriber.start(audioData.buffer);
-                            }}
+                            onClick={onTranscribeClick}
                             isModelLoading={props.transcriber.isModelLoading}
                             // isAudioLoading ||
                             isTranscribing={props.transcriber.isBusy}
+                            progress={progressValue}
+                            idleText={
+                                items.length > 1
+                                    ? `Transcribe All (${items.length})`
+                                    : "Transcribe Audio"
+                            }
                         />
 
                         <SettingsTile
@@ -306,6 +683,26 @@ export function AudioManager(props: { transcriber: Transcriber }) {
                             icon={<SettingsIcon />}
                         />
                     </div>
+
+                    {props.transcriber.isBusy && (
+                        <div className='w-full px-4 pb-2'>
+                            {batch && (
+                                <div className='text-xs text-slate-500 mb-1 truncate'>
+                                    File {batch.index + 1} / {batch.total} —{" "}
+                                    {audioData.name}
+                                </div>
+                            )}
+                            <ProgressBar
+                                progress={`${Math.round(
+                                    (progressValue ?? 0) * 100,
+                                )}%`}
+                            />
+                            <div className='text-xs text-slate-500 mt-1'>
+                                {progressText}
+                            </div>
+                        </div>
+                    )}
+
                     {props.transcriber.progressItems.length > 0 && (
                         <div className='relative z-10 p-4 w-full'>
                             <label>
@@ -365,100 +762,366 @@ function SettingsModal(props: {
     onClose: () => void;
     transcriber: Transcriber;
 }) {
+    const [apiStatus, setApiStatus] = useState<string>("");
+    const [testing, setTesting] = useState(false);
+    const [serverModels, setServerModels] = useState<ApiModelOption[]>([]);
+    const [modelsStatus, setModelsStatus] = useState<string>("");
+    const [loadingModels, setLoadingModels] = useState(false);
+    const [customModel, setCustomModel] = useState(false);
+
     const names = Object.values(LANGUAGES).map(titleCase);
+    const engine = props.transcriber.engine;
+    const isApi = engine === "api";
+    // The "local" engine runs the model inside the Node server
+    // (transformers.js) instead of inside the browser.
+    const isServerLocal = engine === "local";
+    const usesServer = isApi || isServerLocal;
+
+    const currentModel = isServerLocal
+        ? props.transcriber.localModel
+        : props.transcriber.apiModel;
+    const setCurrentModel = isServerLocal
+        ? props.transcriber.setLocalModel
+        : props.transcriber.setApiModel;
+
+    const loadModels = useCallback(async () => {
+        if (!usesServer) return;
+        setLoadingModels(true);
+        setModelsStatus("正在读取服务端模型列表...");
+        const result = await fetchApiModels(
+            props.transcriber.apiBaseUrl,
+            props.transcriber.apiKey,
+        );
+        setLoadingModels(false);
+        if (result.ok) {
+            const cachedCount = result.options.filter((o) => o.cached).length;
+            setServerModels(result.options);
+            setModelsStatus(
+                result.options.length === 0
+                    ? "服务端未返回任何模型"
+                    : `已加载 ${result.options.length} 个选项（${cachedCount} 个已缓存）`,
+            );
+        } else {
+            setServerModels([]);
+            setModelsStatus(
+                `无法读取服务端模型列表（${result.error}），以下为内置别名`,
+            );
+        }
+    }, [usesServer, props.transcriber.apiBaseUrl, props.transcriber.apiKey]);
+
+    // Pull the model list from the server so the local engine can offer the
+    // models whose weights are actually cached.
+    useEffect(() => {
+        if (!props.show || !usesServer) return;
+        void loadModels();
+    }, [props.show, loadModels]);
+
+    // Model choices: server list when available, otherwise built-in aliases.
+    const modelOptions: ApiModelOption[] =
+        serverModels.length > 0
+            ? serverModels
+            : [
+                  "tiny.en",
+                  "tiny",
+                  "base.en",
+                  "base",
+                  "small.en",
+                  "small",
+                  "medium.en",
+                  "distil-large-v2",
+              ].map((id) => ({
+                  id,
+                  note: "内置别名",
+                  cached: false,
+                  kind: "alias" as const,
+              }));
+    const currentInList = modelOptions.some((o) => o.id === currentModel);
 
     const models = {
         // Original checkpoints
-        'Xenova/whisper-tiny': [41, 152],
-        'Xenova/whisper-base': [77, 291],
-        'Xenova/whisper-small': [249],
-        'Xenova/whisper-medium': [776],
+        "Xenova/whisper-tiny": [41, 152],
+        "Xenova/whisper-base": [77, 291],
+        "Xenova/whisper-small": [249],
+        "Xenova/whisper-medium": [776],
 
         // Distil Whisper (English-only)
-        'distil-whisper/distil-medium.en': [402],
-        'distil-whisper/distil-large-v2': [767],
+        "distil-whisper/distil-medium.en": [402],
+        "distil-whisper/distil-large-v2": [767],
     };
+
+    const onTestApi = async () => {
+        setTesting(true);
+        setApiStatus("Checking...");
+        const result = await checkApiHealth(
+            props.transcriber.apiBaseUrl,
+            props.transcriber.apiKey,
+        );
+        setApiStatus((result.ok ? "✓ " : "✗ ") + result.message);
+        setTesting(false);
+    };
+
+    const inputClass =
+        "mt-1 mb-2 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white";
+
     return (
         <Modal
             show={props.show}
             title={"Settings"}
             content={
                 <>
-                    <label>Select the model to use.</label>
+                    <label>Transcription engine</label>
                     <select
-                        className='mt-1 mb-1 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
-                        defaultValue={props.transcriber.model}
+                        className='mt-1 mb-3 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:text-white'
+                        value={props.transcriber.engine}
                         onChange={(e) => {
-                            props.transcriber.setModel(e.target.value);
+                            props.transcriber.setEngine(
+                                e.target.value as Engine,
+                            );
                         }}
                     >
-                        {Object.keys(models)
-                            .filter(
-                                (key) =>
-                                    props.transcriber.quantized ||
-                                    // @ts-ignore
-                                    models[key].length == 2,
-                            )
-                            .filter(
-                                (key) => (
-                                    !props.transcriber.multilingual || !key.startsWith('distil-whisper/')
-                                )
-                            )
-                            .map((key) => (
-                                <option key={key} value={key}>{`${key}${
-                                    (props.transcriber.multilingual || key.startsWith('distil-whisper/')) ? "" : ".en"
-                                } (${
-                                    // @ts-ignore
-                                    models[key][
-                                        props.transcriber.quantized ? 0 : 1
-                                    ]
-                                }MB)`}</option>
-                            ))}
+                        <option value={"browser"}>
+                            Browser (in-browser model)
+                        </option>
+                        <option value={"local"}>
+                            本地引擎 Local engine (server)
+                        </option>
+                        <option value={"api"}>Server API</option>
                     </select>
-                    <div className='flex justify-between items-center mb-3 px-1'>
-                        <div className='flex'>
+
+                    {usesServer && (
+                        <p className='text-xs text-slate-500 mb-2'>
+                            {isServerLocal
+                                ? "本地引擎：由 Node 服务用 transformers.js 转写（权重在服务端 .cache，不占浏览器内存）。"
+                                : "Server API：交给服务端自动选择引擎（openai / command / local）。"}
+                        </p>
+                    )}
+
+                    {usesServer ? (
+                        <>
+                            <label>API base URL</label>
                             <input
-                                id='multilingual'
-                                type='checkbox'
-                                checked={props.transcriber.multilingual}
-                                onChange={(e) => {
-                                    props.transcriber.setMultilingual(
-                                        e.target.checked,
-                                    );
-                                }}
-                            ></input>
-                            <label htmlFor={"multilingual"} className='ms-1'>
-                                Multilingual
-                            </label>
-                        </div>
-                        <div className='flex'>
+                                className={inputClass}
+                                value={props.transcriber.apiBaseUrl}
+                                placeholder='/api'
+                                onChange={(e) =>
+                                    props.transcriber.setApiBaseUrl(
+                                        e.target.value,
+                                    )
+                                }
+                            />
+                            <label>API key (optional)</label>
                             <input
-                                id='quantize'
-                                type='checkbox'
-                                checked={props.transcriber.quantized}
+                                className={inputClass}
+                                type='password'
+                                value={props.transcriber.apiKey}
+                                placeholder='sk-...'
+                                onChange={(e) =>
+                                    props.transcriber.setApiKey(e.target.value)
+                                }
+                            />
+                            <div className='flex items-center justify-between'>
+                                <label>
+                                    Model
+                                    {isServerLocal && (
+                                        <span className='text-xs text-slate-400'>
+                                            （可用服务端已缓存的本地模型）
+                                        </span>
+                                    )}
+                                </label>
+                                <div className='flex items-center space-x-2'>
+                                    {usesServer && (
+                                        <>
+                                            <button
+                                                type='button'
+                                                onClick={() =>
+                                                    void loadModels()
+                                                }
+                                                disabled={loadingModels}
+                                                className='text-slate-500 hover:text-indigo-600 disabled:text-slate-300 text-xs'
+                                            >
+                                                {loadingModels
+                                                    ? "刷新中..."
+                                                    : "刷新列表"}
+                                            </button>
+                                            <button
+                                                type='button'
+                                                onClick={() =>
+                                                    setCustomModel(!customModel)
+                                                }
+                                                className='text-slate-500 hover:text-indigo-600 text-xs'
+                                            >
+                                                {customModel
+                                                    ? "从列表选择"
+                                                    : "手动输入"}
+                                            </button>
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+
+                            {customModel ? (
+                                <input
+                                    className={inputClass}
+                                    value={currentModel}
+                                    placeholder={
+                                        isServerLocal ? "tiny.en" : "whisper-1"
+                                    }
+                                    onChange={(e) =>
+                                        setCurrentModel(e.target.value)
+                                    }
+                                />
+                            ) : (
+                                <select
+                                    className={inputClass}
+                                    value={currentModel}
+                                    onChange={(e) =>
+                                        setCurrentModel(e.target.value)
+                                    }
+                                >
+                                    {!currentInList && (
+                                        <option value={currentModel}>
+                                            {currentModel || "(未选择)"}
+                                            {" — 当前值（不在列表中）"}
+                                        </option>
+                                    )}
+                                    <optgroup label='已缓存（服务端可直接用）'>
+                                        {modelOptions
+                                            .filter((o) => o.cached)
+                                            .map((o) => (
+                                                <option key={o.id} value={o.id}>
+                                                    {o.id} — {o.note}
+                                                </option>
+                                            ))}
+                                    </optgroup>
+                                    <optgroup label='其他可填的模型 / 别名'>
+                                        {modelOptions
+                                            .filter((o) => !o.cached)
+                                            .map((o) => (
+                                                <option key={o.id} value={o.id}>
+                                                    {o.id} — {o.note}
+                                                </option>
+                                            ))}
+                                    </optgroup>
+                                </select>
+                            )}
+                            {usesServer && (
+                                <p
+                                    className={`text-xs mb-2 ${
+                                        serverModels.length
+                                            ? "text-slate-400"
+                                            : "text-amber-600"
+                                    }`}
+                                >
+                                    {modelsStatus}
+                                </p>
+                            )}
+                            <div className='flex items-center space-x-2 mb-2'>
+                                <button
+                                    onClick={onTestApi}
+                                    disabled={testing}
+                                    className='text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 rounded-lg text-xs px-3 py-1.5'
+                                >
+                                    Test connection
+                                </button>
+                                <span className='text-xs text-slate-500 break-all'>
+                                    {apiStatus}
+                                </span>
+                            </div>
+                        </>
+                    ) : (
+                        <>
+                            <label>Select the model to use.</label>
+                            <select
+                                className='mt-1 mb-1 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
+                                defaultValue={props.transcriber.model}
                                 onChange={(e) => {
-                                    props.transcriber.setQuantized(
-                                        e.target.checked,
-                                    );
+                                    props.transcriber.setModel(e.target.value);
                                 }}
-                            ></input>
-                            <label htmlFor={"quantize"} className='ms-1'>
-                                Quantized
-                            </label>
-                        </div>
-                    </div>
-                    {props.transcriber.multilingual && (
+                            >
+                                {Object.keys(models)
+                                    .filter(
+                                        (key) =>
+                                            props.transcriber.quantized ||
+                                            // @ts-ignore
+                                            models[key].length == 2,
+                                    )
+                                    .filter(
+                                        (key) =>
+                                            !props.transcriber.multilingual ||
+                                            !key.startsWith("distil-whisper/"),
+                                    )
+                                    .map((key) => (
+                                        <option key={key} value={key}>{`${key}${
+                                            props.transcriber.multilingual ||
+                                            key.startsWith("distil-whisper/")
+                                                ? ""
+                                                : ".en"
+                                        } (${
+                                            // @ts-ignore
+                                            models[key][
+                                                props.transcriber.quantized
+                                                    ? 0
+                                                    : 1
+                                            ]
+                                        }MB)`}</option>
+                                    ))}
+                            </select>
+                            <div className='flex justify-between items-center mb-3 px-1'>
+                                <div className='flex'>
+                                    <input
+                                        id='multilingual'
+                                        type='checkbox'
+                                        checked={props.transcriber.multilingual}
+                                        onChange={(e) => {
+                                            props.transcriber.setMultilingual(
+                                                e.target.checked,
+                                            );
+                                        }}
+                                    ></input>
+                                    <label
+                                        htmlFor={"multilingual"}
+                                        className='ms-1'
+                                    >
+                                        Multilingual
+                                    </label>
+                                </div>
+                                <div className='flex'>
+                                    <input
+                                        id='quantize'
+                                        type='checkbox'
+                                        checked={props.transcriber.quantized}
+                                        onChange={(e) => {
+                                            props.transcriber.setQuantized(
+                                                e.target.checked,
+                                            );
+                                        }}
+                                    ></input>
+                                    <label
+                                        htmlFor={"quantize"}
+                                        className='ms-1'
+                                    >
+                                        Quantized
+                                    </label>
+                                </div>
+                            </div>
+                        </>
+                    )}
+
+                    {(props.transcriber.multilingual || usesServer) && (
                         <>
                             <label>Select the source language.</label>
                             <select
                                 className='mt-1 mb-3 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
-                                defaultValue={props.transcriber.language}
+                                value={props.transcriber.language}
                                 onChange={(e) => {
                                     props.transcriber.setLanguage(
                                         e.target.value,
                                     );
                                 }}
                             >
+                                {isApi && (
+                                    <option value={"auto"}>Auto detect</option>
+                                )}
                                 {Object.keys(LANGUAGES).map((key, i) => (
                                     <option key={key} value={key}>
                                         {names[i]}
@@ -468,7 +1131,7 @@ function SettingsModal(props: {
                             <label>Select the task to perform.</label>
                             <select
                                 className='mt-1 mb-3 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
-                                defaultValue={props.transcriber.subtask}
+                                value={props.transcriber.subtask}
                                 onChange={(e) => {
                                     props.transcriber.setSubtask(
                                         e.target.value,
@@ -485,7 +1148,6 @@ function SettingsModal(props: {
                 </>
             }
             onClose={props.onClose}
-            onSubmit={() => {}}
         />
     );
 }
@@ -572,51 +1234,65 @@ function UrlModal(props: {
 function FileTile(props: {
     icon: JSX.Element;
     text: string;
-    onFileUpdate: (
-        decoded: AudioBuffer,
-        blobUrl: string,
-        mimeType: string,
-    ) => void;
+    onFilesUpdate: (files: File[]) => void;
 }) {
-    // const audioPlayer = useRef<HTMLAudioElement>(null);
+    const [showModal, setShowModal] = useState(false);
 
-    // Create hidden input element
-    let elem = document.createElement("input");
-    elem.type = "file";
-    elem.oninput = (event) => {
-        // Make sure we have files to use
-        let files = (event.target as HTMLInputElement).files;
-        if (!files) return;
-
-        // Create a blob that we can use as an src for our audio element
-        const urlObj = URL.createObjectURL(files[0]);
-        const mimeType = files[0].type;
-
-        const reader = new FileReader();
-        reader.addEventListener("load", async (e) => {
-            const arrayBuffer = e.target?.result as ArrayBuffer; // Get the ArrayBuffer
-            if (!arrayBuffer) return;
-
-            const audioCTX = new AudioContext({
-                sampleRate: Constants.SAMPLING_RATE,
-            });
-
-            const decoded = await audioCTX.decodeAudioData(arrayBuffer);
-
-            props.onFileUpdate(decoded, urlObj, mimeType);
-        });
-        reader.readAsArrayBuffer(files[0]);
-
-        // Reset files
-        elem.value = "";
+    const pick = (directory: boolean) => {
+        const elem = document.createElement("input");
+        elem.type = "file";
+        elem.accept = "audio/*,video/*";
+        elem.multiple = true;
+        if (directory) {
+            // Non-standard but supported by Chromium / Firefox / Safari
+            elem.setAttribute("webkitdirectory", "");
+            elem.setAttribute("directory", "");
+        }
+        elem.onchange = () => {
+            const files = Array.from(elem.files ?? []);
+            elem.value = "";
+            setShowModal(false);
+            if (files.length > 0) {
+                props.onFilesUpdate(files);
+            }
+        };
+        elem.click();
     };
+
+    const buttonClass =
+        "w-full text-left px-3 py-2 mb-2 rounded-lg border border-slate-200 hover:bg-indigo-50 transition-all duration-200";
 
     return (
         <>
             <Tile
                 icon={props.icon}
                 text={props.text}
-                onClick={() => elem.click()}
+                onClick={() => setShowModal(true)}
+            />
+            <Modal
+                show={showModal}
+                title={"From file"}
+                content={
+                    <div className='flex flex-col'>
+                        <button
+                            className={buttonClass}
+                            onClick={() => pick(false)}
+                        >
+                            选择多个音频文件
+                        </button>
+                        <button
+                            className={buttonClass}
+                            onClick={() => pick(true)}
+                        >
+                            选择整个文件夹（含子目录）
+                        </button>
+                        <p className='text-xs text-slate-400'>
+                            支持 mp3 / wav / m4a / flac / ogg / webm / mp4
+                            等浏览器可解码的格式；多个文件会依次排队转写，可批量导出。
+                        </p>
+                    </div>
+                }
+                onClose={() => setShowModal(false)}
             />
         </>
     );
@@ -746,6 +1422,24 @@ function FolderIcon() {
                 strokeLinecap='round'
                 strokeLinejoin='round'
                 d='M3.75 9.776c.112-.017.227-.026.344-.026h15.812c.117 0 .232.009.344.026m-16.5 0a2.25 2.25 0 00-1.883 2.542l.857 6a2.25 2.25 0 002.227 1.932H19.05a2.25 2.25 0 002.227-1.932l.857-6a2.25 2.25 0 00-1.883-2.542m-16.5 0V6A2.25 2.25 0 016 3.75h3.879a1.5 1.5 0 011.06.44l2.122 2.12a1.5 1.5 0 001.06.44H18A2.25 2.25 0 0120.25 9v.776'
+            />
+        </svg>
+    );
+}
+
+function TrashIcon() {
+    return (
+        <svg
+            xmlns='http://www.w3.org/2000/svg'
+            fill='none'
+            viewBox='0 0 24 24'
+            strokeWidth='1.5'
+            stroke='currentColor'
+        >
+            <path
+                strokeLinecap='round'
+                strokeLinejoin='round'
+                d='M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0'
             />
         </svg>
     );

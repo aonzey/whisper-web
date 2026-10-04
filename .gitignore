@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# Downloaded ONNX weights for the local API engine (npm run fetch-model)
+.cache
+
+# Local workspace metadata (not part of the project)
+.workbuddy/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

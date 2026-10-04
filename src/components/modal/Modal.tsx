@@ -4,7 +4,8 @@ import { Fragment } from "react";
 export interface Props {
     show: boolean;
     onClose: () => void;
-    onSubmit: () => void;
+    /** Optional: the submit button is only rendered when `submitText` is set. */
+    onSubmit?: () => void;
     submitText?: string;
     submitEnabled?: boolean;
     title: string | JSX.Element;

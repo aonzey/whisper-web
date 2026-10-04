@@ -31,4 +31,12 @@ export default {
     DEFAULT_LANGUAGE: "english",
     DEFAULT_QUANTIZED: isMobileOrTablet,
     DEFAULT_MULTILINGUAL: false,
+
+    // Transcription engine: "browser" runs the model inside the browser,
+    // "local" / "api" upload the audio to the bundled Node server
+    // ("local" pins it to the server's in-process transformers.js engine).
+    DEFAULT_ENGINE: "browser",
+    API_BASE_URL: "/api",
+    API_MODEL: "whisper-1",
+    LOCAL_MODEL: "tiny.en",
 };

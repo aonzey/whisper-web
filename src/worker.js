@@ -33,6 +33,8 @@ class PipelineFactory {
     }
 }
 
+let lastProgress = null;
+
 self.addEventListener("message", async (event) => {
     const message = event.data;
 
@@ -53,6 +55,9 @@ self.addEventListener("message", async (event) => {
         status: "complete",
         task: "automatic-speech-recognition",
         data: transcript,
+        progress: lastProgress
+            ? { ...lastProgress, value: 1, processed: lastProgress.total }
+            : undefined,
     });
 });
 
@@ -77,6 +82,35 @@ const transcribe = async (
     if (!isDistilWhisper && !multilingual) {
         modelName += ".en"
     }
+
+    // Sliding-window configuration (also used to estimate the progress)
+    const SAMPLING_RATE = 16000;
+    const chunkLength = isDistilWhisper ? 20 : 30;
+    const strideLength = isDistilWhisper ? 3 : 5;
+    const totalDuration = audio.length / SAMPLING_RATE;
+    const totalChunks =
+        totalDuration <= chunkLength
+            ? 1
+            : Math.ceil((totalDuration - chunkLength) / (chunkLength - strideLength)) + 1;
+
+    const buildProgress = (finishedChunks) => {
+        const processed =
+            finishedChunks <= 0
+                ? 0
+                : Math.min(
+                      totalDuration,
+                      chunkLength + finishedChunks * (chunkLength - strideLength),
+                  );
+        const progress = {
+            value: totalDuration > 0 ? Math.min(1, processed / totalDuration) : 0,
+            processed,
+            total: totalDuration,
+            chunksDone: finishedChunks,
+            chunksTotal: totalChunks,
+        };
+        lastProgress = progress;
+        return progress;
+    };
 
     const p = AutomaticSpeechRecognitionPipelineFactory;
     if (p.model !== modelName || p.quantized !== quantized) {
@@ -141,10 +175,15 @@ const transcribe = async (
             force_full_sequences: false,
         });
 
+        const finishedChunks = chunks_to_process.filter(
+            (chunk) => chunk.finalised,
+        ).length;
+
         self.postMessage({
             status: "update",
             task: "automatic-speech-recognition",
             data: data,
+            progress: buildProgress(finishedChunks),
         });
     }
 
@@ -155,8 +194,8 @@ const transcribe = async (
         do_sample: false,
 
         // Sliding window
-        chunk_length_s: isDistilWhisper ? 20 : 30,
-        stride_length_s: isDistilWhisper ? 3 : 5,
+        chunk_length_s: chunkLength,
+        stride_length_s: strideLength,
 
         // Language and task
         language: language,

@@ -1,10 +1,25 @@
 interface Props extends React.ButtonHTMLAttributes<HTMLButtonElement> {
     isModelLoading: boolean;
     isTranscribing: boolean;
+    /** Transcription progress (0 - 1). Undefined -> indeterminate. */
+    progress?: number;
+    /** Text shown while idle, defaults to "Transcribe Audio". */
+    idleText?: string;
 }
 
 export function TranscribeButton(props: Props): JSX.Element {
-    const { isModelLoading, isTranscribing, onClick, ...buttonProps } = props;
+    const {
+        isModelLoading,
+        isTranscribing,
+        progress,
+        idleText,
+        onClick,
+        ...buttonProps
+    } = props;
+
+    const percentage =
+        progress === undefined ? undefined : Math.round(progress * 100);
+
     return (
         <button
             {...buttonProps}
@@ -19,9 +34,15 @@ export function TranscribeButton(props: Props): JSX.Element {
             {isModelLoading ? (
                 <Spinner text={"Loading model..."} />
             ) : isTranscribing ? (
-                <Spinner text={"Transcribing..."} />
+                <Spinner
+                    text={
+                        percentage === undefined
+                            ? "Transcribing..."
+                            : `Transcribing... ${percentage}%`
+                    }
+                />
             ) : (
-                "Transcribe Audio"
+                idleText ?? "Transcribe Audio"
             )}
         </button>
     );

@@ -2,41 +2,28 @@ import { useRef, useEffect } from "react";
 
 import { TranscriberData } from "../hooks/useTranscriber";
 import { formatAudioTimestamp } from "../utils/AudioUtils";
+import { exportChunks } from "../utils/ExportUtils";
 
 interface Props {
     transcribedData: TranscriberData | undefined;
+    /** Used as the base name of the exported files. */
+    fileName?: string;
 }
 
-export default function Transcript({ transcribedData }: Props) {
+export default function Transcript({ transcribedData, fileName }: Props) {
     const divRef = useRef<HTMLDivElement>(null);
 
-    const saveBlob = (blob: Blob, filename: string) => {
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = filename;
-        link.click();
-        URL.revokeObjectURL(url);
-    };
     const exportTXT = () => {
-        let chunks = transcribedData?.chunks ?? [];
-        let text = chunks
-            .map((chunk) => chunk.text)
-            .join("")
-            .trim();
-
-        const blob = new Blob([text], { type: "text/plain" });
-        saveBlob(blob, "transcript.txt");
+        const chunks = transcribedData?.chunks ?? [];
+        exportChunks(chunks, fileName ?? "transcript", "txt");
+    };
+    const exportSRT = () => {
+        const chunks = transcribedData?.chunks ?? [];
+        exportChunks(chunks, fileName ?? "transcript", "srt");
     };
     const exportJSON = () => {
-        let jsonData = JSON.stringify(transcribedData?.chunks ?? [], null, 2);
-
-        // post-process the JSON to make it more readable
-        const regex = /(    "timestamp": )\[\s+(\S+)\s+(\S+)\s+\]/gm;
-        jsonData = jsonData.replace(regex, "$1[$2 $3]");
-
-        const blob = new Blob([jsonData], { type: "application/json" });
-        saveBlob(blob, "transcript.json");
+        const chunks = transcribedData?.chunks ?? [];
+        exportChunks(chunks, fileName ?? "transcript", "json");
     };
 
     // Scroll to the bottom when the component updates
@@ -79,6 +66,12 @@ export default function Transcript({ transcribedData }: Props) {
                         className='text-white bg-green-500 hover:bg-green-600 focus:ring-4 focus:ring-green-300 font-medium rounded-lg text-sm px-4 py-2 text-center mr-2 dark:bg-green-600 dark:hover:bg-green-700 dark:focus:ring-green-800 inline-flex items-center'
                     >
                         Export TXT
+                    </button>
+                    <button
+                        onClick={exportSRT}
+                        className='text-white bg-green-500 hover:bg-green-600 focus:ring-4 focus:ring-green-300 font-medium rounded-lg text-sm px-4 py-2 text-center mr-2 dark:bg-green-600 dark:hover:bg-green-700 dark:focus:ring-green-800 inline-flex items-center'
+                    >
+                        Export SRT
                     </button>
                     <button
                         onClick={exportJSON}
