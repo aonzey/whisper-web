@@ -30,6 +30,57 @@ function joinUrl(base: string, path: string) {
     return trimmed + (path.startsWith("/") ? path : `/${path}`);
 }
 
+/**
+ * What did the user type into the "Base URL" field?
+ *
+ * - `self`   → our own Node server (`/api`, `http://host:8787/api`, empty).
+ *              Requests are `<base>/transcribe`, `<base>/health`, `<base>/models`.
+ * - `openai` → any OpenAI compatible endpoint, e.g.
+ *              `https://api.groq.com/openai/v1` **or** the full
+ *              `https://api.groq.com/openai/v1/audio/transcriptions`.
+ *              The browser cannot call those directly (CORS + it does not use
+ *              the system proxy), so requests are relayed through our own
+ *              server with `upstream_*` fields.
+ */
+export type ApiTarget =
+    | { kind: "self"; baseUrl: string }
+    | { kind: "openai"; baseUrl: string; endpoint: string };
+
+/** Base url used to reach our own server (the relay). */
+export const SELF_API_BASE = "/api";
+
+export function classifyApiBase(input: string): ApiTarget {
+    const raw = (input || "").trim();
+    const self: ApiTarget = {
+        kind: "self",
+        baseUrl: raw ? raw.replace(/\/+$/, "") : SELF_API_BASE,
+    };
+
+    // Relative paths (`/api`) always mean our own server.
+    if (!/^https?:\/\//i.test(raw)) return self;
+    // ...as does an explicit .../api on our own host.
+    if (/\/api\/?$/i.test(raw)) return self;
+
+    const base = raw.replace(/\/+$/, "");
+    // The user may paste the full endpoint — keep the API root separately so
+    // `/models` probing still works.
+    const full = base.match(/^(.*?)\/audio\/transcriptions?$/i);
+    const root = full?.[1] ? full[1].replace(/\/+$/, "") : base;
+    return {
+        kind: "openai",
+        baseUrl: root,
+        endpoint: `${root}/audio/transcriptions`,
+    };
+}
+
+/** Human readable description of the resolved target (shown in Settings). */
+export function describeApiTarget(target: ApiTarget): string {
+    if (target.kind === "self") {
+        return "本项目服务端（Node API）";
+    }
+    return `第三方 OpenAI 兼容端点：${target.endpoint}（经本地服务端中转）`;
+}
+
 function authHeaders(apiKey?: string) {
     const headers: Record<string, string> = {};
     if (apiKey) {
@@ -37,6 +88,22 @@ function authHeaders(apiKey?: string) {
         headers["X-API-Key"] = apiKey;
     }
     return headers;
+}
+
+/** Readable error from an axios failure (prefers the server's own message). */
+function errorMessage(error: any, fallback: string): string {
+    const data = error?.response?.data;
+    const detail =
+        typeof data === "string"
+            ? data.slice(0, 400)
+            : data?.error ??
+              data?.message ??
+              (data ? JSON.stringify(data).slice(0, 400) : "");
+    const status = error?.response?.status;
+    const prefix = status ? `HTTP ${status}` : "";
+    return [prefix, detail || error?.message || fallback]
+        .filter(Boolean)
+        .join(" — ");
 }
 
 /**
@@ -100,24 +167,45 @@ export async function checkApiHealth(
     baseUrl: string,
     apiKey?: string,
 ): Promise<{ ok: boolean; message: string }> {
+    const target = classifyApiBase(baseUrl);
     try {
-        const { data } = await axios.get(joinUrl(baseUrl, "/health"), {
-            headers: authHeaders(apiKey),
-            timeout: 8000,
+        // Third party endpoints have no /health — probe /models through our
+        // server instead (it also proves the key works).
+        const url =
+            target.kind === "self"
+                ? joinUrl(target.baseUrl, "/health")
+                : joinUrl(SELF_API_BASE, "/upstream/health");
+        const params =
+            target.kind === "self"
+                ? undefined
+                : { baseUrl: target.baseUrl, apiKey: apiKey ?? "" };
+
+        const { data } = await axios.get(url, {
+            params,
+            headers: authHeaders(target.kind === "self" ? apiKey : undefined),
+            timeout: 15000,
         });
+
+        if (target.kind === "self") {
+            return {
+                ok: true,
+                message: `OK — engine: ${data?.engine ?? "unknown"}, model: ${
+                    data?.model ?? "unknown"
+                }`,
+            };
+        }
         return {
             ok: true,
-            message: `OK — engine: ${data?.engine ?? "unknown"}, model: ${
-                data?.model ?? "unknown"
-            }`,
+            message:
+                data?.message ??
+                `OK — ${target.baseUrl}（${
+                    data?.models?.length ?? "?"
+                } 个模型）`,
         };
     } catch (error: any) {
         return {
             ok: false,
-            message:
-                error?.response?.data?.error ??
-                error?.message ??
-                "Request failed",
+            message: errorMessage(error, "Request failed"),
         };
     }
 }
@@ -147,8 +235,34 @@ export async function fetchApiModels(
     baseUrl: string,
     apiKey?: string,
 ): Promise<{ ok: boolean; options: ApiModelOption[]; error?: string }> {
+    const target = classifyApiBase(baseUrl);
     try {
-        const { data } = await axios.get(joinUrl(baseUrl, "/models"), {
+        // Third party endpoint → list its own models through our server.
+        if (target.kind === "openai") {
+            const { data } = await axios.get(
+                joinUrl(SELF_API_BASE, "/upstream/models"),
+                {
+                    params: { baseUrl: target.baseUrl, apiKey: apiKey ?? "" },
+                    timeout: 15000,
+                },
+            );
+            const models: string[] = Array.isArray(data?.models)
+                ? data.models
+                : [];
+            return {
+                ok: true,
+                options: models.map((id) => ({
+                    id,
+                    note: /whisper|asr|audio|distil/i.test(id)
+                        ? "上游语音模型"
+                        : "上游模型（非语音）",
+                    cached: false,
+                    kind: "remote" as const,
+                })),
+            };
+        }
+
+        const { data } = await axios.get(joinUrl(target.baseUrl, "/models"), {
             headers: authHeaders(apiKey),
             timeout: 8000,
         });
@@ -223,10 +337,7 @@ export async function fetchApiModels(
         return {
             ok: false,
             options: [],
-            error:
-                error?.response?.data?.error ??
-                error?.message ??
-                "无法连接服务端",
+            error: errorMessage(error, "无法连接服务端"),
         };
     }
 }
@@ -247,6 +358,7 @@ export async function transcribeViaApi(
         onProgress,
     } = options;
 
+    const target = classifyApiBase(baseUrl);
     const form = new FormData();
     form.append("file", file, fileName ?? "audio.wav");
     if (model) form.append("model", model);
@@ -256,13 +368,32 @@ export async function transcribeViaApi(
     form.append("response_format", "verbose_json");
     form.append("timestamp_granularities[]", "segment");
 
-    const { data } = await axios.post(joinUrl(baseUrl, "/transcribe"), form, {
-        headers: authHeaders(apiKey),
-        timeout: 0, // transcription can take a long time
-        onUploadProgress: (event) => {
-            if (onProgress) onProgress(event.progress ?? 0);
-        },
-    });
+    let url: string;
+    let headers = authHeaders(apiKey);
 
-    return normalizeTranscription(data);
+    if (target.kind === "self") {
+        url = joinUrl(target.baseUrl, "/transcribe");
+    } else {
+        // Relay through our own server: the browser cannot reach Groq & co.
+        // directly (CORS, and it ignores the system proxy).
+        url = joinUrl(SELF_API_BASE, "/transcribe");
+        form.append("upstream_base_url", target.baseUrl);
+        if (apiKey) form.append("upstream_api_key", apiKey);
+        if (model) form.append("upstream_model", model);
+        // Only our own server needs the key header (it may require API_TOKEN).
+        headers = {};
+    }
+
+    try {
+        const { data } = await axios.post(url, form, {
+            headers,
+            timeout: 0, // transcription can take a long time
+            onUploadProgress: (event) => {
+                if (onProgress) onProgress(event.progress ?? 0);
+            },
+        });
+        return normalizeTranscription(data);
+    } catch (error: any) {
+        throw new Error(errorMessage(error, "转写请求失败"));
+    }
 }

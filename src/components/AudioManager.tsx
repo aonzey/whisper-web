@@ -13,6 +13,8 @@ import { exportAll } from "../utils/ExportUtils";
 import {
     checkApiHealth,
     fetchApiModels,
+    classifyApiBase,
+    describeApiTarget,
     ApiModelOption,
 } from "../utils/ApiClient";
 
@@ -776,6 +778,8 @@ function SettingsModal(props: {
     // (transformers.js) instead of inside the browser.
     const isServerLocal = engine === "local";
     const usesServer = isApi || isServerLocal;
+    // "/api" (our own server) vs. a third party OpenAI compatible endpoint.
+    const apiTarget = classifyApiBase(props.transcriber.apiBaseUrl);
 
     const currentModel = isServerLocal
         ? props.transcriber.localModel
@@ -786,6 +790,12 @@ function SettingsModal(props: {
 
     const loadModels = useCallback(async () => {
         if (!usesServer) return;
+        // Listing a third party endpoint's models needs its key.
+        if (apiTarget.kind === "openai" && !props.transcriber.apiKey) {
+            setServerModels([]);
+            setModelsStatus("填写 API Key 后自动拉取上游模型列表");
+            return;
+        }
         setLoadingModels(true);
         setModelsStatus("正在读取服务端模型列表...");
         const result = await fetchApiModels(
@@ -804,10 +814,17 @@ function SettingsModal(props: {
         } else {
             setServerModels([]);
             setModelsStatus(
-                `无法读取服务端模型列表（${result.error}），以下为内置别名`,
+                apiTarget.kind === "openai"
+                    ? `无法读取上游模型列表（${result.error}），以下为常见模型名`
+                    : `无法读取服务端模型列表（${result.error}），以下为内置别名`,
             );
         }
-    }, [usesServer, props.transcriber.apiBaseUrl, props.transcriber.apiKey]);
+    }, [
+        usesServer,
+        apiTarget.kind,
+        props.transcriber.apiBaseUrl,
+        props.transcriber.apiKey,
+    ]);
 
     // Pull the model list from the server so the local engine can offer the
     // models whose weights are actually cached.
@@ -817,9 +834,9 @@ function SettingsModal(props: {
     }, [props.show, loadModels]);
 
     // Model choices: server list when available, otherwise built-in aliases.
-    const modelOptions: ApiModelOption[] =
-        serverModels.length > 0
-            ? serverModels
+    const fallbackIds =
+        apiTarget.kind === "openai"
+            ? ["whisper-large-v3", "whisper-large-v3-turbo", "whisper-1"]
             : [
                   "tiny.en",
                   "tiny",
@@ -829,7 +846,11 @@ function SettingsModal(props: {
                   "small",
                   "medium.en",
                   "distil-large-v2",
-              ].map((id) => ({
+              ];
+    const modelOptions: ApiModelOption[] =
+        serverModels.length > 0
+            ? serverModels
+            : fallbackIds.map((id) => ({
                   id,
                   note: "内置别名",
                   cached: false,
@@ -892,6 +913,8 @@ function SettingsModal(props: {
                         <p className='text-xs text-slate-500 mb-2'>
                             {isServerLocal
                                 ? "本地引擎：由 Node 服务用 transformers.js 转写（权重在服务端 .cache，不占浏览器内存）。"
+                                : apiTarget.kind === "openai"
+                                ? "Server API：把音频转发给你填写的 OpenAI 兼容端点（经本地服务端中转）。"
                                 : "Server API：交给服务端自动选择引擎（openai / command / local）。"}
                         </p>
                     )}
@@ -902,13 +925,23 @@ function SettingsModal(props: {
                             <input
                                 className={inputClass}
                                 value={props.transcriber.apiBaseUrl}
-                                placeholder='/api'
+                                placeholder='/api 或 https://api.groq.com/openai/v1'
                                 onChange={(e) =>
                                     props.transcriber.setApiBaseUrl(
                                         e.target.value,
                                     )
                                 }
                             />
+                            <p className='text-xs text-slate-400 mb-2'>
+                                {describeApiTarget(apiTarget)}
+                                {apiTarget.kind === "openai" && (
+                                    <>
+                                        <br />
+                                        浏览器无法直连第三方（CORS
+                                        且不走系统代理），请求会经本地服务端中转。
+                                    </>
+                                )}
+                            </p>
                             <label>API key (optional)</label>
                             <input
                                 className={inputClass}

@@ -115,7 +115,7 @@ npm run server       # API 会顺带托管 dist/，直接访问 http://localhost
 | --- | --- | --- | --- | --- |
 | **Browser (in-browser model)** | 浏览器 Web Worker | 零部署、音频不出本机、不依赖后端 | 首次要下载模型到浏览器缓存；占浏览器内存；低端机很慢 | 演示、隐私敏感、单机轻量使用 |
 | **本地引擎 Local engine (server)** | Node 服务端进程内（transformers.js） | 模型权重只在服务端存一份、可离线、浏览器压力小、可被 API 复用 | 需要跑 `npm run server`；需要 `ffmpeg` | **日常主力用法** |
-| **Server API** | 由服务端决定（local / openai / command） | 可以接更强的远端模型（Groq、DashScope、faster-whisper 等） | 需要配置上游与 Key | 想要更好识别质量或有自建推理服务 |
+| **Server API** | 由服务端决定；Base URL 填第三方地址时转发到该端点 | 可以接更强的远端模型（Groq、DashScope、faster-whisper 等），下拉框直接列出上游模型 | 需要配置上游与 Key，且必须开着 `npm run server`（浏览器无法直连） | 想要更好识别质量或有自建推理服务 |
 
 切换位置：**Settings → Transcription engine**。选择会写进 `localStorage`。
 
@@ -194,7 +194,7 @@ ask what you can do for your country.
 | **Model** | 下拉框。服务端引擎下由 `GET /api/models` 填充，分两组：<br>· **已缓存（服务端可直接用）** —— 权重已在 `LOCAL_CACHE_DIR`，带精度与体积<br>· **其他可填的模型 / 别名** —— 未下载，选中会触发下载或报不可用 |
 | **刷新列表** | 重新拉取 `/api/models`（下完新模型后点它） |
 | **手动输入** | 切换成文本框，可填写列表里没有的模型 id |
-| **Base URL** | 默认 `/api`（vite 已代理到 8787）。独立部署时填 `http://host:8787/api` |
+| **Base URL** | 默认 `/api`（vite 已代理到 8787）。也可填第三方 OpenAI 兼容端点，如 `https://api.groq.com/openai/v1`（见[下节](#接入第三方-openai-兼容端点groq--dashscope-)）。下方会实时显示识别结果 |
 | **API Key** | 服务端设了 `API_TOKEN` 时才需要 |
 | **Test connection** | 打 `/api/health`，会回显服务端当前引擎与模型 |
 | **Multilingual** | 勾选后可指定语言与 `translate` 任务 |
@@ -257,9 +257,11 @@ whisper-web API listening on http://localhost:8787
 | Method | Endpoint | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/health` | 健康检查：引擎、模型、代理、已缓存模型、是否需鉴权 |
-| `GET` | `/api/models` | 可用模型（已缓存 + 别名 + 远端模型） |
+| `GET` | `/api/models` | 本服务端可用模型（已缓存 + 别名 + 远端模型） |
 | `POST` | `/api/transcribe` | 上传音频转写 |
 | `POST` | `/v1/audio/transcriptions` | 上一行的 OpenAI 兼容别名 |
+| `GET` | `/api/upstream/models` | 查询**第三方**端点的模型列表（`baseUrl` / `apiKey`） |
+| `GET` | `/api/upstream/health` | 探活第三方端点（同上参数） |
 
 ### 三种引擎
 
@@ -287,6 +289,9 @@ whisper-web API listening on http://localhost:8787
 | `engine` | | 强制引擎：`local` / `openai` / `command` |
 | `quantized` | | `false` 用 fp32 权重（默认 `true`） |
 | `response_format` / `format` | | `txt` / `srt` / `json`，见下 |
+| `upstream_base_url` | | 用**其它** OpenAI 兼容端点（Groq、DashScope、自建 faster-whisper…），见下节 |
+| `upstream_api_key` | | 该端点的 Key |
+| `upstream_model` | | 该端点的模型名（默认同 `model`） |
 
 `response_format` 也可以作为 **query 参数**传递（`?format=srt`）。
 
@@ -365,6 +370,51 @@ curl -s -H "Authorization: Bearer $API_TOKEN" -F "file=@a.mp3" \
      http://localhost:8787/api/transcribe
 ```
 
+### 接入第三方 OpenAI 兼容端点（Groq / DashScope / ...）
+
+Settings → **Server API** → *API base URL* 可以填三种形式：
+
+| 填法 | 效果 |
+| --- | --- |
+| `/api`（默认） | 用本项目自带的服务端 |
+| `https://api.groq.com/openai/v1` | 第三方端点根地址 |
+| `https://api.groq.com/openai/v1/audio/transcriptions` | 完整端点地址（自动归一化成根地址） |
+
+填了第三方地址后，**请求会经本地 Node 服务端中转**，原因是浏览器无法直连：
+
+- 跨域（CORS）会被拦；
+- 浏览器**不走系统代理**，而本机出网必须走代理。
+
+服务端已装 `undici` 的 `EnvHttpProxyAgent`，会应用 `HTTP_PROXY` / `HTTPS_PROXY`，
+所以由它代发请求才有网。因此**用第三方端点时 `npm run server` 必须开着**。
+
+配套行为：
+
+- *Model* 下拉框会拉 `GET /api/upstream/models`，直接列出上游真实模型
+  （如 Groq 的 `whisper-large-v3`、`whisper-large-v3-turbo`），**不用手打**；
+  语音类模型排在最前。
+- *Test connection* 打 `/api/upstream/health`，会回显 `OK — 可达，N 个模型`，
+  或把上游的原始报错（401 无效 Key、404 地址错）原样显示出来。
+- 上游的 4xx / 5xx 会**原样透传**，例如模型名打错会看到
+  `上游 400 … The model 'xxx' does not exist`。
+
+服务端想禁用这种按请求切换上游（多用户部署时），设 `ALLOW_UPSTREAM_OVERRIDE=0`。
+
+```bash
+# 直接用 curl 走中转（不经过页面）
+curl -s --noproxy '*' \
+  -F "file=@a.mp3" \
+  -F "model=whisper-large-v3" \
+  -F "upstream_base_url=https://api.groq.com/openai/v1" \
+  -F "upstream_api_key=$GROQ_API_KEY" \
+  http://localhost:8787/api/transcribe
+
+# 先看这个端点通不通、有哪些模型
+curl -s --noproxy '*' -G http://localhost:8787/api/upstream/models \
+  --data-urlencode "baseUrl=https://api.groq.com/openai/v1" \
+  --data-urlencode "apiKey=$GROQ_API_KEY"
+```
+
 ### 环境变量
 
 复制 `server/.env.example` 为 `server/.env`，或直接 export。
@@ -386,6 +436,7 @@ curl -s -H "Authorization: Bearer $API_TOKEN" -F "file=@a.mp3" \
 | `WHISPER_COMMAND_MODEL` | `base` | CLI 默认模型 |
 | `WHISPER_COMMAND_TIMEOUT_MS` | `1800000` | CLI 超时（30 分钟） |
 | `MAX_UPLOAD_MB` | `200` | 单文件上限 |
+| `ALLOW_UPSTREAM_OVERRIDE` | `1` | 是否允许请求里带 `upstream_base_url` 切换上游；`0` 禁用 |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | — | 出网代理，服务端已自动接管 |
 
 ---
@@ -485,7 +536,25 @@ taskkill /PID <PID> /F
 curl 把 localhost 也送进了代理。加 `--noproxy '*'`（Git Bash），
 或设置 `NO_PROXY=localhost,127.0.0.1`。
 
-**B3. 浏览器端模型下不动**
+**B3. 填了 Groq / 其它第三方地址还是失败**
+
+按顺序自查：
+
+1. **本地服务端必须开着**（`npm run server`）——第三方请求是它代发的。
+2. 浏览器**不走系统代理**，所以千万别指望页面直连外网，必须中转。
+3. 模型名要用**上游的真实模型名**。Groq 是 `whisper-large-v3` /
+   `whisper-large-v3-turbo`，不是本项目本地引擎的 `tiny.en` / `base`。
+   用下拉框选，别手打。
+4. 看报错：现在上游的 401 / 404 / 400 会原样显示（例如 `Invalid API Key`、
+   `The model 'xxx' does not exist`），比原来的 `fetch failed` 好定位得多。
+
+**B4. `pkill -f "server/index.js"` 把自己的 shell 也杀了**
+
+Git Bash 里 `pkill -f` 会匹配到**当前这条命令行本身**（因为里面也有这个字符串），
+结果是命令自杀、新服务根本没起来，而旧进程还活着 —— 表现为"改了代码没生效"。
+用 `netstat -ano | grep :8787` 拿 PID 再 `taskkill /PID <PID> /F`。
+
+**B5. 浏览器端模型下不动**
 
 浏览器引擎由 `src/worker.js` 里 `env.allowLocalModels = false` 控制，
 **强制从 huggingface.co 下载**。HF 不可达时，浏览器引擎等于不可用——

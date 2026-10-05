@@ -52,6 +52,12 @@ const WHISPER_COMMAND_MODEL = process.env.WHISPER_COMMAND_MODEL || "base";
 const COMMAND_TIMEOUT_MS = Number(
     process.env.WHISPER_COMMAND_TIMEOUT_MS || 30 * 60 * 1000,
 );
+// When a request carries `upstream_base_url`, forward to that OpenAI
+// compatible endpoint instead of OPENAI_BASE_URL (used by the UI's
+// "Server API" engine so the browser does not have to call Groq & friends
+// directly — no CORS, and the server's proxy settings apply).
+const ALLOW_UPSTREAM_OVERRIDE =
+    String(process.env.ALLOW_UPSTREAM_OVERRIDE || "1").toLowerCase() !== "0";
 const LOCAL_DEFAULT_MODEL =
     process.env.LOCAL_MODEL || "Xenova/whisper-tiny.en";
 const LOCAL_CACHE_DIR =
@@ -184,9 +190,11 @@ function listLocalModels() {
     return found;
 }
 
-function resolveEngine(model, explicit) {
+function resolveEngine(model, explicit, upstreamBase) {
     if (explicit) return explicit;
     if (CONFIGURED_ENGINE) return CONFIGURED_ENGINE;
+    // A per-request upstream always means "call that OpenAI compatible API".
+    if (upstreamBase) return "openai";
     if (LOCAL_MODEL_PATTERN.test(model || "")) return "local";
     if (SIZE_ALIAS.test(model || "") || DISTIL_ALIAS.test(model || "")) {
         return "local";
@@ -375,7 +383,7 @@ async function runLocal({ file, model, language, task, quantized }) {
  * Engine: openai (forward to an OpenAI compatible endpoint)
  * ------------------------------------------------------------------ */
 
-async function forwardToOpenAI({ file, model, language, task, apiKey }) {
+async function forwardToOpenAI({ file, model, language, task, apiKey, baseUrl }) {
     const form = new FormData();
     const blob = new Blob([file.buffer], {
         type: file.mimetype || "application/octet-stream",
@@ -387,7 +395,8 @@ async function forwardToOpenAI({ file, model, language, task, apiKey }) {
     form.append("timestamp_granularities[]", "segment");
     if (task === "translate") form.append("task", "translate");
 
-    const url = `${OPENAI_BASE_URL}/audio/transcriptions`;
+    const base = upstreamRoot(baseUrl || OPENAI_BASE_URL);
+    const url = `${base}/audio/transcriptions`;
     let response;
     try {
         response = await fetch(url, {
@@ -406,7 +415,11 @@ async function forwardToOpenAI({ file, model, language, task, apiKey }) {
 
     const body = await response.text();
     if (!response.ok) {
-        throw new Error(`Upstream ${response.status}: ${body.slice(0, 500)}`);
+        // Surface the upstream payload: model typos (e.g. `whisper-large-v3`
+        // vs `whisper-large-v3-turbo`) and bad keys are only visible there.
+        throw new Error(
+            `上游 ${response.status} ${response.statusText}: ${body.slice(0, 600)}`,
+        );
     }
     try {
         return JSON.parse(body);
@@ -491,23 +504,52 @@ function transcribeHandler(req, res) {
     const language = req.body?.language || "";
     const task = req.body?.task === "translate" ? "translate" : "transcribe";
     const quantized = req.body?.quantized !== "false";
+
+    // Per-request upstream (lets the UI target Groq / DashScope / a self hosted
+    // faster-whisper without restarting the server). The browser cannot call
+    // those directly (CORS + no proxy), so it relays through this server.
+    const upstreamBase = String(
+        req.body?.upstream_base_url || req.body?.openai_base_url || "",
+    ).trim();
+    const upstreamKey = String(
+        req.body?.upstream_api_key || req.body?.openai_api_key || "",
+    ).trim();
+    const upstreamModel = String(
+        req.body?.upstream_model || req.body?.openai_model || "",
+    ).trim();
+
     // `engine` can be forced per request (form field or ?engine=) which makes
     // curl testing much easier: -F engine=local / engine=command / engine=openai
     const explicitEngine = String(
         req.body?.engine || req.query?.engine || "",
     ).toLowerCase();
-    const engine = resolveEngine(requestedModel, explicitEngine);
+    const engine = resolveEngine(requestedModel, explicitEngine, upstreamBase);
     const model =
         engine === "local" ? toLocalModelId(requestedModel) : requestedModel;
     // Allow callers to bring their own upstream key when the server has none.
     const header = req.get("authorization") || "";
     const incomingKey = header.startsWith("Bearer ") ? header.slice(7) : "";
-    const apiKey = OPENAI_API_KEY || incomingKey || "";
 
-    if (engine === "openai" && !apiKey && !process.env.OPENAI_BASE_URL) {
+    const useUpstream = Boolean(upstreamBase) && ALLOW_UPSTREAM_OVERRIDE;
+    if (upstreamBase && !ALLOW_UPSTREAM_OVERRIDE) {
+        return res.status(403).json({
+            error: "服务端已禁用按请求覆盖上游（ALLOW_UPSTREAM_OVERRIDE=0）",
+        });
+    }
+
+    const effectiveBase = useUpstream ? upstreamBase : OPENAI_BASE_URL;
+    const apiKey = useUpstream
+        ? upstreamKey || OPENAI_API_KEY || incomingKey
+        : OPENAI_API_KEY || incomingKey || "";
+    const effectiveModel = useUpstream && upstreamModel
+        ? upstreamModel
+        : model;
+
+    if (engine === "openai" && !apiKey && !useUpstream) {
         return res.status(400).json({
             error:
-                "openai 引擎未配置：请设置 OPENAI_API_KEY（或 OPENAI_BASE_URL）。" +
+                "openai 引擎未配置：请设置 OPENAI_API_KEY（或 OPENAI_BASE_URL），" +
+                "或在请求里带上 upstream_base_url / upstream_api_key。" +
                 "本机没有外网到 api.openai.com，建议改用 -F engine=local " +
                 "（先 npm run fetch-model）或 -F engine=command。",
         });
@@ -521,15 +563,16 @@ function transcribeHandler(req, res) {
     } else {
         job = forwardToOpenAI({
             file: req.file,
-            model,
+            model: effectiveModel,
             language,
             task,
             apiKey,
+            baseUrl: effectiveBase,
         });
     }
 
     job.then((raw) => {
-        const result = normalize(raw, requestedModel, engine);
+        const result = normalize(raw, effectiveModel || model, engine);
 
         // `response_format` (or `format`) lets callers receive the exact
         // payload the UI exports: txt / srt / json.
@@ -573,6 +616,116 @@ function transcribeHandler(req, res) {
     });
 }
 
+/**
+ * Probe / list models of an arbitrary OpenAI compatible endpoint.
+ * The browser cannot do this itself (CORS + no system proxy), so it asks
+ * this server:  GET /api/upstream/models?base_url=...&api_key=...
+ */
+/** Strip a trailing `/audio/transcriptions` so probing `/models` still works. */
+function upstreamRoot(baseUrl) {
+    const base = String(baseUrl || "").replace(/\/+$/, "");
+    return base.replace(/\/audio\/transcriptions?$/i, "") || base;
+}
+
+async function queryUpstream(baseUrl, apiKey, path) {
+    const base = upstreamRoot(baseUrl);
+    if (!/^https?:\/\//i.test(base)) {
+        throw new Error(`上游地址无效：${baseUrl}`);
+    }
+    const url = `${base}${path}`;
+    let response;
+    try {
+        response = await fetch(url, {
+            method: "GET",
+            headers: {
+                ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+            },
+        });
+    } catch (error) {
+        const cause = error?.cause?.message ? ` (${error.cause.message})` : "";
+        throw new Error(
+            `无法访问上游 ${url}: ${error?.message ?? error}${cause}. ` +
+                `请检查地址、API Key，以及代理设置（服务端会自动应用 HTTP(S)_PROXY）。`,
+        );
+    }
+    const body = await response.text();
+    if (!response.ok) {
+        throw new Error(
+            `上游 ${response.status} ${response.statusText}: ${body.slice(0, 500)}`,
+        );
+    }
+    try {
+        return JSON.parse(body);
+    } catch (e) {
+        throw new Error(`上游返回不是 JSON: ${body.slice(0, 300)}`);
+    }
+}
+
+/** Ids from an OpenAI style /models response (`{data:[{id}]}` or `[...]`). */
+function extractModelIds(payload) {
+    const list = Array.isArray(payload)
+        ? payload
+        : Array.isArray(payload?.data)
+          ? payload.data
+          : [];
+    return list
+        .map((item) => (typeof item === "string" ? item : item?.id))
+        .filter((id) => typeof id === "string" && id.length > 0);
+}
+
+app.get("/api/upstream/models", requireToken, async (req, res) => {
+    const baseUrl = String(
+        req.query?.baseUrl ?? req.query?.base_url ?? "",
+    );
+    if (!baseUrl) {
+        return res.status(400).json({ error: "缺少 baseUrl 参数" });
+    }
+    try {
+        const payload = await queryUpstream(
+            baseUrl,
+            String(req.query?.apiKey ?? req.query?.api_key ?? ""),
+            "/models",
+        );
+        const all = extractModelIds(payload);
+        // Audio endpoints only make sense for the whisper family; keep the
+        // rest available but sorted last.
+        const audio = all.filter((id) => /whisper|asr|audio|distil/i.test(id));
+        const rest = all.filter((id) => !audio.includes(id));
+        res.json({ ok: true, baseUrl, models: [...audio, ...rest], all });
+    } catch (error) {
+        res.status(502).json({ ok: false, error: error?.message ?? String(error) });
+    }
+});
+
+app.get("/api/upstream/health", requireToken, async (req, res) => {
+    const baseUrl = String(
+        req.query?.baseUrl ?? req.query?.base_url ?? "",
+    );
+    if (!baseUrl) {
+        return res.status(400).json({ error: "缺少 baseUrl 参数" });
+    }
+    try {
+        const payload = await queryUpstream(
+            baseUrl,
+            String(req.query?.apiKey ?? req.query?.api_key ?? ""),
+            "/models",
+        );
+        const ids = extractModelIds(payload);
+        res.json({
+            ok: true,
+            baseUrl,
+            message: `OK — 可达，${ids.length} 个模型`,
+            models: ids.slice(0, 200),
+        });
+    } catch (error) {
+        res.status(502).json({
+            ok: false,
+            baseUrl,
+            error: error?.message ?? String(error),
+        });
+    }
+});
+
 app.get("/api/health", (req, res) => {
     const cached = listLocalModels();
     res.json({
@@ -592,6 +745,7 @@ app.get("/api/health", (req, res) => {
         localReady: cached.length > 0,
         proxy: PROXY_URL || null,
         authRequired: Boolean(API_TOKEN),
+        upstreamOverride: ALLOW_UPSTREAM_OVERRIDE,
         ffmpeg: true,
         time: new Date().toISOString(),
     });
