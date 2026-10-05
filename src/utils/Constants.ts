@@ -45,4 +45,11 @@ export default {
     DEFAULT_TRANSLATION_TARGET: "zh",
     DEFAULT_TRANSLATION_MODEL: "Xenova/nllb-200-distilled-600M",
     DEFAULT_TRANSLATION_API_MODEL: "gpt-4o-mini",
+
+    // The translation "Server API" engine has its own endpoint / key — it is
+    // deliberately independent from the transcription side.
+    TRANSLATION_API_BASE_URL: "/api",
+    TRANSLATION_API_KEY: "",
+    /** Extra instructions appended to the LLM translation prompt. */
+    TRANSLATION_PROMPT: "",
 };

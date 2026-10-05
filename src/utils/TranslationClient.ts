@@ -129,6 +129,8 @@ export interface TranslateOptions {
     /** Server API base url (our own server, or an OpenAI compatible root). */
     baseUrl?: string;
     apiKey?: string;
+    /** Free-form instructions for the LLM engine (ignored by 🤗 models). */
+    prompt?: string;
     lines: string[];
     onProgress?: (done: number, total: number) => void;
 }
@@ -156,6 +158,7 @@ export async function translateViaServer(
         sourceLanguage,
         targetLanguage,
         context,
+        prompt,
         onProgress,
     } = options;
 
@@ -168,6 +171,9 @@ export async function translateViaServer(
         source_language: sourceLanguage || "",
     };
     if (model) payload.model = model;
+    if (prompt && String(prompt).trim()) {
+        payload.extra_prompt = String(prompt);
+    }
     if (context && context.length) payload.context_lines = context;
     if (target.kind === "openai") {
         payload.upstream_base_url = target.baseUrl;

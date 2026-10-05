@@ -262,6 +262,40 @@ function modelTask(model) {
     return "";
 }
 
+/** Which cache sub-folder a model lives in ("" = legacy flat layout). */
+function modelFolderTask(model) {
+    try {
+        const rel = path
+            .relative(CACHE_ROOT, resolveModelDir(model).dir)
+            .split(path.sep)[0];
+        if (rel === ASR_SUBDIR) return "asr";
+        if (rel === MT_SUBDIR) return "translation";
+    } catch (e) {
+        // ignore
+    }
+    return "";
+}
+
+/**
+ * "asr" | "translation" | "" (unknown).
+ * The config.json is authoritative; the cache folder is the fallback so a
+ * model whose config cannot be read still lands in the right dropdown.
+ */
+function classifyModel(model) {
+    return modelTask(model) || modelFolderTask(model);
+}
+
+/** Keep only the models usable for `task` ("asr" | "translation"). */
+function filterByTask(ids, task) {
+    if (task === "translation") {
+        return ids.filter((id) => classifyModel(id) !== "asr");
+    }
+    if (task === "asr") {
+        return ids.filter((id) => classifyModel(id) !== "translation");
+    }
+    return ids;
+}
+
 /** Every model id that has usable weights in the cache. */
 function listLocalModels() {
     const found = new Set();
@@ -700,6 +734,7 @@ async function translateViaChat({
     sourceLanguage,
     targetLanguage,
     context,
+    extraPrompt,
     apiKey,
     baseUrl,
 }) {
@@ -708,6 +743,7 @@ async function translateViaChat({
         context: context ?? [],
         sourceLanguage,
         targetLanguage,
+        extraPrompt,
     });
 
     const base = upstreamRoot(baseUrl || OPENAI_BASE_URL);
@@ -768,6 +804,7 @@ async function translateLines({
     upstreamBase,
     upstreamKey,
     upstreamModel,
+    extraPrompt,
 }) {
     const list = (lines ?? []).map((line) => String(line ?? ""));
     const size = Math.max(1, TRANSLATION_BATCH_SIZE);
@@ -805,6 +842,7 @@ async function translateLines({
                 sourceLanguage,
                 targetLanguage,
                 context: merged,
+                extraPrompt,
                 apiKey: upstreamKey || OPENAI_API_KEY || "",
                 baseUrl: upstreamBase || OPENAI_BASE_URL,
             });
@@ -814,6 +852,20 @@ async function translateLines({
         }
     }
     return result;
+}
+
+/**
+ * Free-form instructions for the LLM translation engine. Only the
+ * "openai" (chat) engine can use them — 🤗 models ignore them.
+ */
+function extraPromptOf(req) {
+    return String(
+        req.body?.extra_prompt ??
+            req.body?.translation_prompt ??
+            req.body?.prompt ??
+            req.query?.extra_prompt ??
+            "",
+    );
 }
 
 /** Which translation engine should handle this request? */
@@ -1052,6 +1104,7 @@ async function bilingualHandler(req, res) {
                           req.body?.translationModel ??
                           "",
                   ).trim(),
+                  extraPrompt: extraPromptOf(req),
               })
             : [];
 
@@ -1097,8 +1150,12 @@ async function translateHandler(req, res) {
         const sourceLanguage = String(
             req.body?.source_language ?? req.body?.sourceLanguage ?? "",
         );
+        // `translation_*` lets a caller keep the translation endpoint separate
+        // from the transcription one (the UI does this per request anyway).
         const upstreamBase = String(
-            req.body?.upstream_base_url || "",
+            req.body?.upstream_base_url ||
+                req.body?.translation_base_url ||
+                "",
         ).trim();
         const engine = resolveTranslationEngine(
             String(req.body?.engine ?? "").toLowerCase(),
@@ -1115,8 +1172,13 @@ async function translateHandler(req, res) {
                 ? req.body.context_lines
                 : [],
             upstreamBase,
-            upstreamKey: String(req.body?.upstream_api_key || "").trim(),
+            upstreamKey: String(
+                req.body?.upstream_api_key ||
+                    req.body?.translation_api_key ||
+                    "",
+            ).trim(),
             upstreamModel: String(req.body?.upstream_model || "").trim(),
+            extraPrompt: extraPromptOf(req),
         });
 
         res.json({
@@ -1276,8 +1338,11 @@ app.get("/api/health", (req, res) => {
 });
 
 app.get("/api/models", requireToken, (req, res) => {
-    const cached = listLocalModels();
-    const cachedSet = new Set(cached);
+    // "asr" (transcription column) / "translation" (translation column) /
+    // "" (everything). Lets each Settings column list only its own models.
+    const taskFilter = String(req.query?.task ?? "").toLowerCase();
+    const cached = filterByTask(listLocalModels(), taskFilter);
+    const cachedSet = new Set(listLocalModels());
 
     // Rich per-model info so the UI can mark which ones are actually usable.
     const models = cached.map((id) => {
@@ -1293,7 +1358,7 @@ app.get("/api/models", requireToken, (req, res) => {
             // "" when the config cannot be read. Translation models also ship
             // an `encoder_model*.onnx`, so the UI needs this to tell them
             // apart in the model dropdown.
-            task: modelTask(id),
+            task: classifyModel(id),
             // Which cache folder the weights live in.
             folder: path
                 .relative(CACHE_ROOT, resolveModelDir(id).dir)
@@ -1301,18 +1366,22 @@ app.get("/api/models", requireToken, (req, res) => {
         };
     });
 
-    // Common aliases accepted by the local engine
-    const aliasIds = [
-        "tiny",
-        "tiny.en",
-        "base",
-        "base.en",
-        "small",
-        "small.en",
-        "medium",
-        "medium.en",
-        "distil-large-v2",
-    ];
+    // Common aliases accepted by the local engine (transcription only —
+    // translation models have no short alias).
+    const aliasIds =
+        taskFilter === "translation"
+            ? []
+            : [
+                  "tiny",
+                  "tiny.en",
+                  "base",
+                  "base.en",
+                  "small",
+                  "small.en",
+                  "medium",
+                  "medium.en",
+                  "distil-large-v2",
+              ];
     const aliases = aliasIds.map((id) => ({
         id,
         target: toLocalModelId(id),
@@ -1321,6 +1390,8 @@ app.get("/api/models", requireToken, (req, res) => {
 
     res.json({
         engine: CONFIGURED_ENGINE || "auto",
+        // Echoed back so the UI can tell which column this list belongs to.
+        task: taskFilter,
         defaultModel: defaultModel(),
         local: {
             cacheDir: LOCAL_CACHE_DIR,

@@ -214,7 +214,7 @@ Settings 弹窗**左右并列两栏**：左边 `Transcription engine`，右边
 | --- | --- |
 | **Transcription engine** | 见[第 2 节](#2-三种转写引擎该怎么选) |
 | **Model** | 下拉框。服务端引擎下由 `GET /api/models` 填充（只列 `task=asr` 的模型），分两组：<br>· **已缓存（服务端可直接用）** —— 权重已在 `.cache/Transcription models`，带精度与体积<br>· **其他可填的模型 / 别名** —— 未下载，选中会触发下载或报不可用 |
-| **刷新列表** | 重新拉取 `/api/models`（下完新模型后点它） |
+| **刷新列表** | 重新拉取 `/api/models?task=asr`（下完新模型后点它）。左栏只列转写模型，状态行会直接把已缓存的 id 列出来 |
 | **手动输入** | 切换成文本框，可填写列表里没有的模型 id |
 | **Base URL** | 默认 `/api`（vite 已代理到 8787）。也可填第三方 OpenAI 兼容端点，如 `https://api.groq.com/openai/v1`（见[下节](#接入第三方-openai-兼容端点groq--dashscope-)）。下方会实时显示识别结果 |
 | **API Key** | 服务端设了 `API_TOKEN` 时才需要 |
@@ -231,12 +231,18 @@ Settings 弹窗**左右并列两栏**：左边 `Transcription engine`，右边
 | **Translation engine** | 见[第 8 节](#8-双语字幕-bilingual-subtitles) |
 | **Translate subtitles into** | 目标语言，80+ 种可选（含简体/繁体中文） |
 | **Translation model** | 浏览器/本地引擎选 🤗 翻译模型；Server API 选聊天模型 |
-| **刷新列表** | 重新拉取服务端**翻译**模型（只列 `task=translation` 的），下完新翻译模型后点它 |
+| **刷新列表** | 重新拉取**翻译**模型：`GET /api/models?task=translation`（自有的已缓存模型）或第三方端点的 `/models`。状态行会直接列出已缓存的 id。下完新翻译模型后点它 |
 | **手动输入** | 切换成文本框，可填写列表里没有的模型 id |
+| **Translation API base URL** | 仅 Server API 显示。**与左侧完全独立**，默认 `/api`。填第三方地址时经本地服务端中转 |
+| **Translation API key** | 仅 Server API 显示。第三方端点必填；只走自有服务端且设了 `API_TOKEN` 时填同一个 token |
+| **Test connection** | 只探测右栏自己的端点（第三方端点走 `/api/upstream/health`） |
+| **Prompt（补充要求）** | 追加到 LLM 翻译提示词的自定义指令（如「人名保留原文」「口语化表达」）。**仅 Server API 引擎生效**，🤗 模型会忽略 |
 
-两个下拉框各显示各的已缓存模型：`/api/models` 会按 `config.json` 的
-`model_type` 给每个模型打 `asr` / `translation` 标签，转写框里不会出现
-`opus-mt` 这类翻译模型，反之亦然。
+两栏各拉各的、各显示各的：左栏请求 `?task=asr`，右栏请求
+`?task=translation`。`/api/models` 先读 `config.json` 的 `model_type`、
+读不到再按缓存子目录（`Transcription models` / `Translation models`）
+给每个模型打 `asr` / `translation` 标签，因此转写框里不会出现 `opus-mt`
+这类翻译模型，反之亦然。
 
 所有设置存 `localStorage`（前缀 `whisper-web:`），刷新不丢。
 
@@ -290,13 +296,15 @@ Settings 弹窗**左右并列两栏**：左边 `Transcription engine`，右边
 | --- | --- | --- | --- |
 | **Browser (in-browser model)** | 浏览器 Web Worker 里的 🤗 Transformers.js | 不想起服务端、机器内存够 | 首次自动下载所选模型（默认 `Xenova/nllb-200-distilled-600M`，约 250MB） |
 | **本地引擎 Local engine (server)** | Node 服务端进程内 | 完全离线、想复用服务端缓存 | `npm run fetch-model -- Xenova/opus-mt-en-zh` |
-| **Server API** | OpenAI 兼容的 `/chat/completions` | **上下文语境翻译质量最好** | 填好 Base URL + API Key + 聊天模型（复用 Server API 的设置） |
+| **Server API** | OpenAI 兼容的 `/chat/completions` | **上下文语境翻译质量最好** | 在右栏填好 **Translation API base URL** + **Translation API key** + 聊天模型（与左侧转写配置互不影响） |
 
 - 浏览器/本地引擎用 🤗 翻译模型（`Xenova/nllb-200-distilled-600M`、
   `Xenova/m2m100_418M`、`Xenova/opus-mt-en-zh` 等），NLLB / m2m100 / mBART
   会自动带上 `src_lang` / `tgt_lang` 语言码。
 - Server API 走 LLM：提示词要求「按 `<序号>\t<译文>` 逐行输出」，
   解析失败会退化为按行对齐，保证句数不错位。
+- 右栏的 **Prompt（补充要求）** 会作为「用户补充要求」追加进提示词，
+  可用来固定术语、语气、人名处理等（只对 Server API 生效）。
 - 翻译期间按钮显示 `Translating... n/N`，进度条按句推进。
 
 > 浏览器依然**不能直连**第三方端点（CORS + 不走系统代理），
@@ -401,7 +409,7 @@ whisper-web API listening on http://localhost:8787
 | Method | Endpoint | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/health` | 健康检查：引擎、模型、代理、已缓存模型、是否需鉴权 |
-| `GET` | `/api/models` | 本服务端可用模型（已缓存 + 别名 + 远端模型） |
+| `GET` | `/api/models` | 本服务端可用模型（已缓存 + 别名 + 远端模型）。加 `?task=asr` 只返回转写模型，`?task=translation` 只返回翻译模型 |
 | `POST` | `/api/transcribe` | 上传音频转写 |
 | `POST` | `/api/bilingual` | 转写 **+ 翻译**，返回双语结果 |
 | `POST` | `/api/translate` | 只翻译：`{ lines, target_language }` → `{ translations }` |
@@ -575,6 +583,32 @@ curl -s --noproxy '*' -X POST http://localhost:8787/api/translate \
          }'
 # {"translations":["你好世界。","今天天气不错"],"engine":"local","target_language":"zh",...}
 ```
+
+LLM（Server API）引擎可用的额外字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `upstream_base_url` / `translation_base_url` | 翻译专用端点（与转写的上游互不影响） |
+| `upstream_api_key` / `translation_api_key` | 该端点的 Key |
+| `upstream_model` / `translation_model` | 聊天模型名 |
+| `extra_prompt` / `translation_prompt` / `prompt` | 追加到提示词的自定义要求 |
+
+```bash
+curl -s --noproxy '*' -X POST http://localhost:8787/api/translate \
+     -H "Content-Type: application/json" \
+     -d '{
+           "engine": "openai",
+           "translation_base_url": "https://api.groq.com/openai/v1",
+           "translation_api_key": "gsk_xxx",
+           "model": "llama-3.3-70b-versatile",
+           "target_language": "zh",
+           "extra_prompt": "人名保留原文，用口语化中文",
+           "lines": ["Hello world."]
+         }'
+```
+
+对应 CLI：`--translation-base-url` / `--translation-api-key` /
+`--translation-prompt`。
 
 `context_lines: [{ text, trans }]` 可传入已译好的前几句作为上下文（LLM 引擎有效）。
 

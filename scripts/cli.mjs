@@ -117,6 +117,10 @@ function usage() {
       --source <lang>            source language hint
       --translation-engine local|openai
       --translation-model <id>   Xenova/nllb-200-distilled-600M | gpt-4o-mini ...
+      --translation-base-url <url>   translation-only endpoint (default: reuse
+                                     --upstream-base-url / the server config)
+      --translation-api-key <key>
+      --translation-prompt <text>    extra instructions for the LLM engine
       --upstream-base-url <url>  OpenAI compatible endpoint (Groq, DashScope, ...)
       --upstream-api-key <key>
       --upstream-model <id>

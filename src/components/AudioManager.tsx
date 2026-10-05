@@ -21,6 +21,7 @@ import {
     fetchApiModels,
     classifyApiBase,
     describeApiTarget,
+    SELF_API_BASE,
     ApiModelOption,
 } from "../utils/ApiClient";
 
@@ -909,12 +910,21 @@ function SettingsModal(props: {
     transcriber: Transcriber;
 }) {
     const [apiStatus, setApiStatus] = useState<string>("");
-    const [testing, setTesting] = useState(false);
-    const [serverModels, setServerModels] = useState<ApiModelOption[]>([]);
-    const [modelsStatus, setModelsStatus] = useState<string>("");
-    const [translationModelsStatus, setTranslationModelsStatus] =
+    const [translationApiStatus, setTranslationApiStatus] =
         useState<string>("");
-    const [loadingModels, setLoadingModels] = useState(false);
+    const [testing, setTesting] = useState(false);
+    const [testingTranslation, setTestingTranslation] = useState(false);
+
+    // One independent list per column: the transcription column only shows
+    // whisper family models, the translation column only opus-mt / nllb / chat
+    // models. They are fetched, cached and refreshed separately.
+    const [asrModels, setAsrModels] = useState<ApiModelOption[]>([]);
+    const [asrStatus, setAsrStatus] = useState<string>("");
+    const [asrLoading, setAsrLoading] = useState(false);
+    const [mtModels, setMtModels] = useState<ApiModelOption[]>([]);
+    const [mtStatus, setMtStatus] = useState<string>("");
+    const [mtLoading, setMtLoading] = useState(false);
+
     const [customModel, setCustomModel] = useState(false);
     const [customTranslationModel, setCustomTranslationModel] = useState(false);
 
@@ -929,6 +939,15 @@ function SettingsModal(props: {
     // "/api" (our own server) vs. a third party OpenAI compatible endpoint.
     const apiTarget = classifyApiBase(props.transcriber.apiBaseUrl);
 
+    // The translation engine talks to its own endpoint. The `local` engine
+    // always runs on our own server, even when the field points elsewhere.
+    const translationBaseUrl =
+        translationEngine === "local" &&
+        classifyApiBase(props.transcriber.translationApiBaseUrl).kind !== "self"
+            ? SELF_API_BASE
+            : props.transcriber.translationApiBaseUrl;
+    const translationApiTarget = classifyApiBase(translationBaseUrl);
+
     const currentModel = isServerLocal
         ? props.transcriber.localModel
         : props.transcriber.apiModel;
@@ -936,48 +955,51 @@ function SettingsModal(props: {
         ? props.transcriber.setLocalModel
         : props.transcriber.setApiModel;
 
-    const loadModels = useCallback(async () => {
+    /** Short summary so the user sees *which* models are actually cached. */
+    const summarize = (options: ApiModelOption[], empty: string) => {
+        if (options.length === 0) return empty;
+        const cached = options.filter((option) => option.cached);
+        if (cached.length === 0)
+            return `已加载 ${options.length} 个选项（无已缓存）`;
+        return `已缓存 ${cached.length} 个：${cached
+            .slice(0, 6)
+            .map((option) => option.id)
+            .join("、")}${cached.length > 6 ? " …" : ""}`;
+    };
+
+    /** Transcription column: whisper family models cached on the server. */
+    const loadAsrModels = useCallback(async () => {
         // Listing a third party endpoint's models needs its key.
         if (apiTarget.kind === "openai" && !props.transcriber.apiKey) {
-            setServerModels([]);
-            setModelsStatus("填写 API Key 后自动拉取上游模型列表");
-            setTranslationModelsStatus("填写 API Key 后自动拉取上游模型列表");
+            setAsrModels([]);
+            setAsrStatus(
+                "第三方端点：填写上面的 API Key 后点「刷新列表」拉取上游模型",
+            );
             return;
         }
-        setLoadingModels(true);
-        setModelsStatus("正在读取服务端模型列表...");
-        const result = await fetchApiModels(
-            props.transcriber.apiBaseUrl,
-            props.transcriber.apiKey,
-        );
-        setLoadingModels(false);
+        setAsrLoading(true);
+        setAsrStatus("正在读取服务端转写模型列表...");
+        const result = await fetchApiModels({
+            baseUrl: props.transcriber.apiBaseUrl,
+            apiKey: props.transcriber.apiKey,
+            task: "asr",
+        });
+        setAsrLoading(false);
         if (result.ok) {
-            setServerModels(result.options);
-            setModelsStatus(
-                result.options.length === 0
-                    ? "服务端未返回任何模型"
-                    : `已加载 ${result.options.length} 个选项（${
-                          result.options.filter(
-                              (o) => o.task !== "translation" && o.cached,
-                          ).length
-                      } 个转写模型已缓存）`,
-            );
-            setTranslationModelsStatus(
-                result.options.length === 0
-                    ? "服务端未返回任何模型"
-                    : `已加载 ${
-                          result.options.filter((o) => o.task === "translation")
-                              .length
-                      } 个已缓存翻译模型`,
+            setAsrModels(result.options);
+            setAsrStatus(
+                summarize(
+                    result.options,
+                    "服务端没有转写模型，先执行 npm run fetch-model",
+                ),
             );
         } else {
-            setServerModels([]);
-            const message =
+            setAsrModels([]);
+            setAsrStatus(
                 apiTarget.kind === "openai"
                     ? `无法读取上游模型列表（${result.error}），以下为常见模型名`
-                    : `无法读取服务端模型列表（${result.error}），以下为内置别名`;
-            setModelsStatus(message);
-            setTranslationModelsStatus(message);
+                    : `无法读取服务端模型列表（${result.error}），以下为内置别名`,
+            );
         }
     }, [
         apiTarget.kind,
@@ -985,14 +1007,62 @@ function SettingsModal(props: {
         props.transcriber.apiKey,
     ]);
 
-    // Pull the model list from the server so the local engine can offer the
-    // models whose weights are actually cached. The translation engine needs it
-    // too (its models live in a separate cache folder).
-    const needsServerModels = usesServer || translationEngine === "local";
+    /**
+     * Translation column: translation models cached on the server, or the
+     * chat models of the endpoint configured on this side.
+     */
+    const loadMtModels = useCallback(async () => {
+        if (
+            translationApiTarget.kind === "openai" &&
+            !props.transcriber.translationApiKey
+        ) {
+            setMtModels([]);
+            setMtStatus(
+                "第三方端点：填写下面的 Translation API Key 后点「刷新列表」拉取上游模型",
+            );
+            return;
+        }
+        setMtLoading(true);
+        setMtStatus("正在读取翻译模型列表...");
+        const result = await fetchApiModels({
+            baseUrl: translationBaseUrl,
+            apiKey: props.transcriber.translationApiKey,
+            task: "translation",
+        });
+        setMtLoading(false);
+        if (result.ok) {
+            setMtModels(result.options);
+            setMtStatus(
+                summarize(
+                    result.options,
+                    "服务端没有翻译模型，先执行 npm run fetch-model -- Xenova/opus-mt-en-zh",
+                ),
+            );
+        } else {
+            setMtModels([]);
+            setMtStatus(`无法读取翻译模型列表（${result.error}）`);
+        }
+    }, [
+        translationApiTarget.kind,
+        translationBaseUrl,
+        props.transcriber.translationApiKey,
+    ]);
+
+    // Load both lists when the modal opens (and whenever the engine selection
+    // changes) so every column starts with its own cached models. Typing in a
+    // URL field does not re-trigger this — use the per-column refresh button.
+    const autoLoadSignature = `${engine}|${translationEngine}`;
+    const loadedSignature = useRef("");
     useEffect(() => {
-        if (!props.show || !needsServerModels) return;
-        void loadModels();
-    }, [props.show, needsServerModels, loadModels]);
+        if (!props.show) {
+            loadedSignature.current = "";
+            return;
+        }
+        if (loadedSignature.current === autoLoadSignature) return;
+        loadedSignature.current = autoLoadSignature;
+        void loadAsrModels();
+        void loadMtModels();
+    }, [props.show, autoLoadSignature, loadAsrModels, loadMtModels]);
 
     // Model choices: server list when available, otherwise built-in aliases.
     const fallbackIds =
@@ -1012,8 +1082,8 @@ function SettingsModal(props: {
     // `encoder_model*.onnx`, so `/api/models` reports them too — never offer
     // them as a transcription model.
     const modelOptions: ApiModelOption[] = (
-        serverModels.length > 0
-            ? serverModels
+        asrModels.length > 0
+            ? asrModels
             : fallbackIds.map((id) => ({
                   id,
                   note: "内置别名",
@@ -1023,6 +1093,7 @@ function SettingsModal(props: {
               }))
     ).filter((option: ApiModelOption) => option.task !== "translation");
     const currentInList = modelOptions.some((o) => o.id === currentModel);
+    const cachedAsrModels = modelOptions.filter((option) => option.cached);
 
     const models = {
         // Original checkpoints
@@ -1047,6 +1118,18 @@ function SettingsModal(props: {
         setTesting(false);
     };
 
+    /** Probe the endpoint configured on the translation side. */
+    const onTestTranslationApi = async () => {
+        setTestingTranslation(true);
+        setTranslationApiStatus("Checking...");
+        const result = await checkApiHealth(
+            translationBaseUrl,
+            props.transcriber.translationApiKey,
+        );
+        setTranslationApiStatus((result.ok ? "✓ " : "✗ ") + result.message);
+        setTestingTranslation(false);
+    };
+
     const inputClass =
         "mt-1 mb-2 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white";
     const selectClass =
@@ -1061,16 +1144,33 @@ function SettingsModal(props: {
         translationEngine === "api"
             ? props.transcriber.setTranslationApiModel
             : props.transcriber.setTranslationModel;
-    // Cached translation models reported by the server come first.
-    const cachedTranslationModels = serverModels
-        .filter((option) => option.task === "translation")
+    // Translation column: cached weights first, then the upstream chat models
+    // (only meaningful for a third party endpoint), then the built-in presets.
+    const cachedTranslationModels = mtModels
+        .filter((option) => option.cached)
         .map((option) => ({
             id: option.id,
-            note: "已缓存（服务端）",
+            // The chat endpoint cannot run 🤗 weights — say so instead of
+            // silently offering an unusable model.
+            note:
+                translationEngine === "api"
+                    ? "已缓存（🤗 模型，需切换到本地引擎）"
+                    : "已缓存（服务端）",
             multilingual: true,
             size: "",
         }));
-    const translationModelOptions =
+    const upstreamTranslationModels =
+        translationApiTarget.kind === "openai"
+            ? mtModels
+                  .filter((option) => !option.cached)
+                  .map((option) => ({
+                      id: option.id,
+                      note: "上游聊天模型",
+                      multilingual: true,
+                      size: "",
+                  }))
+            : [];
+    const presetTranslationModels = (
         translationEngine === "api"
             ? TRANSLATION_API_MODELS.map((id) => ({
                   id,
@@ -1078,15 +1178,21 @@ function SettingsModal(props: {
                   multilingual: true,
                   size: "",
               }))
-            : [
-                  ...cachedTranslationModels,
-                  ...TRANSLATION_MODELS.filter(
-                      (option) =>
-                          !cachedTranslationModels.some(
-                              (cached) => cached.id === option.id,
-                          ),
-                  ),
-              ];
+            : TRANSLATION_MODELS
+    ).filter(
+        (option) =>
+            !cachedTranslationModels.some(
+                (cached) => cached.id === option.id,
+            ) &&
+            !upstreamTranslationModels.some(
+                (remote) => remote.id === option.id,
+            ),
+    );
+    const translationModelOptions = [
+        ...cachedTranslationModels,
+        ...upstreamTranslationModels,
+        ...presetTranslationModels,
+    ];
     const translationModelList = translationModelOptions.map(
         (option) => option.id,
     );
@@ -1179,35 +1285,31 @@ function SettingsModal(props: {
                                         )}
                                     </label>
                                     <div className='flex items-center space-x-2'>
-                                        {usesServer && (
-                                            <>
-                                                <button
-                                                    type='button'
-                                                    onClick={() =>
-                                                        void loadModels()
-                                                    }
-                                                    disabled={loadingModels}
-                                                    className='text-slate-500 hover:text-indigo-600 disabled:text-slate-300 text-xs'
-                                                >
-                                                    {loadingModels
-                                                        ? "刷新中..."
-                                                        : "刷新列表"}
-                                                </button>
-                                                <button
-                                                    type='button'
-                                                    onClick={() =>
-                                                        setCustomModel(
-                                                            !customModel,
-                                                        )
-                                                    }
-                                                    className='text-slate-500 hover:text-indigo-600 text-xs'
-                                                >
-                                                    {customModel
-                                                        ? "从列表选择"
-                                                        : "手动输入"}
-                                                </button>
-                                            </>
-                                        )}
+                                        <>
+                                            <button
+                                                type='button'
+                                                onClick={() =>
+                                                    void loadAsrModels()
+                                                }
+                                                disabled={asrLoading}
+                                                className='text-slate-500 hover:text-indigo-600 disabled:text-slate-300 text-xs'
+                                            >
+                                                {asrLoading
+                                                    ? "刷新中..."
+                                                    : "刷新列表"}
+                                            </button>
+                                            <button
+                                                type='button'
+                                                onClick={() =>
+                                                    setCustomModel(!customModel)
+                                                }
+                                                className='text-slate-500 hover:text-indigo-600 text-xs'
+                                            >
+                                                {customModel
+                                                    ? "从列表选择"
+                                                    : "手动输入"}
+                                            </button>
+                                        </>
                                     </div>
                                 </div>
 
@@ -1264,15 +1366,15 @@ function SettingsModal(props: {
                                         </optgroup>
                                     </select>
                                 )}
-                                {usesServer && (
+                                {asrStatus && (
                                     <p
                                         className={`text-xs mb-2 ${
-                                            serverModels.length
+                                            asrModels.length
                                                 ? "text-slate-400"
                                                 : "text-amber-600"
                                         }`}
                                     >
-                                        {modelsStatus}
+                                        {asrStatus}
                                     </p>
                                 )}
                                 <div className='flex items-center space-x-2 mb-2'>
@@ -1379,7 +1481,34 @@ function SettingsModal(props: {
                                         </label>
                                     </div>
                                 </div>
+                                <div className='flex items-center space-x-2 mb-2'>
+                                    <button
+                                        type='button'
+                                        onClick={() => void loadAsrModels()}
+                                        disabled={asrLoading}
+                                        className='text-slate-500 hover:text-indigo-600 disabled:text-slate-300 text-xs'
+                                    >
+                                        {asrLoading ? "刷新中..." : "刷新列表"}
+                                    </button>
+                                    <span className='text-xs text-slate-400'>
+                                        {cachedAsrModels.length
+                                            ? `服务端已缓存 ${cachedAsrModels.length} 个转写模型`
+                                            : "读取服务端已缓存的转写模型"}
+                                    </span>
+                                </div>
                             </>
+                        )}
+
+                        {asrStatus && (
+                            <p
+                                className={`text-xs mb-2 ${
+                                    asrModels.length
+                                        ? "text-slate-400"
+                                        : "text-amber-600"
+                                }`}
+                            >
+                                {asrStatus}
+                            </p>
                         )}
 
                         {(props.transcriber.multilingual || usesServer) && (
@@ -1495,18 +1624,14 @@ function SettingsModal(props: {
                                 </span>
                             </label>
                             <div className='flex items-center space-x-2'>
-                                {translationEngine !== "api" && (
-                                    <button
-                                        type='button'
-                                        onClick={() => void loadModels()}
-                                        disabled={loadingModels}
-                                        className='text-slate-500 hover:text-indigo-600 disabled:text-slate-300 text-xs'
-                                    >
-                                        {loadingModels
-                                            ? "刷新中..."
-                                            : "刷新列表"}
-                                    </button>
-                                )}
+                                <button
+                                    type='button'
+                                    onClick={() => void loadMtModels()}
+                                    disabled={mtLoading}
+                                    className='text-slate-500 hover:text-indigo-600 disabled:text-slate-300 text-xs'
+                                >
+                                    {mtLoading ? "刷新中..." : "刷新列表"}
+                                </button>
                                 <button
                                     type='button'
                                     onClick={() =>
@@ -1557,23 +1682,109 @@ function SettingsModal(props: {
                                 ))}
                             </select>
                         )}
-                        {translationEngine !== "api" &&
-                            translationModelsStatus && (
-                                <p className='text-xs text-slate-400 mb-2'>
-                                    {translationModelsStatus}
-                                </p>
-                            )}
+                        {mtStatus && (
+                            <p
+                                className={`text-xs mb-2 ${
+                                    mtModels.length
+                                        ? "text-slate-400"
+                                        : "text-amber-600"
+                                }`}
+                            >
+                                {mtStatus}
+                            </p>
+                        )}
+
+                        {translationEngine === "api" && (
+                            <>
+                                <div className='border-t border-slate-200 pt-2 mt-1'>
+                                    <p className='text-xs text-slate-500 mb-1'>
+                                        以下三项与左侧 Transcription 完全独立，
+                                        翻译只使用这里的配置。
+                                    </p>
+                                    <label>Translation API base URL</label>
+                                    <input
+                                        className={inputClass}
+                                        value={
+                                            props.transcriber
+                                                .translationApiBaseUrl
+                                        }
+                                        placeholder='/api 或 https://api.groq.com/openai/v1'
+                                        onChange={(e) =>
+                                            props.transcriber.setTranslationApiBaseUrl(
+                                                e.target.value,
+                                            )
+                                        }
+                                    />
+                                    <p className='text-xs text-slate-400 mb-2 break-all'>
+                                        {describeApiTarget(
+                                            translationApiTarget,
+                                        )}
+                                        {translationApiTarget.kind ===
+                                            "openai" && (
+                                            <>
+                                                <br />
+                                                浏览器无法直连第三方（CORS
+                                                且不走系统代理），请求会经本地服务端中转。
+                                            </>
+                                        )}
+                                    </p>
+                                    <label>Translation API key</label>
+                                    <input
+                                        className={inputClass}
+                                        type='password'
+                                        value={
+                                            props.transcriber.translationApiKey
+                                        }
+                                        placeholder='sk-...'
+                                        onChange={(e) =>
+                                            props.transcriber.setTranslationApiKey(
+                                                e.target.value,
+                                            )
+                                        }
+                                    />
+                                    <div className='flex items-center space-x-2 mb-2'>
+                                        <button
+                                            onClick={onTestTranslationApi}
+                                            disabled={testingTranslation}
+                                            className='text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 rounded-lg text-xs px-3 py-1.5'
+                                        >
+                                            Test connection
+                                        </button>
+                                        <span className='text-xs text-slate-500 break-all'>
+                                            {translationApiStatus}
+                                        </span>
+                                    </div>
+                                </div>
+                            </>
+                        )}
+
+                        <label>
+                            Prompt（补充要求）
+                            <span className='text-xs text-slate-400'>
+                                {translationEngine === "api"
+                                    ? "（追加到翻译提示词，仅 Server API 生效）"
+                                    : "（仅 Server API 引擎生效）"}
+                            </span>
+                        </label>
+                        <textarea
+                            className={inputClass}
+                            rows={3}
+                            value={props.transcriber.translationPrompt}
+                            placeholder={
+                                "例如：使用简体中文口语化表达；人名保留原文；" +
+                                "“Transformer”统一译为“变换器”"
+                            }
+                            onChange={(e) =>
+                                props.transcriber.setTranslationPrompt(
+                                    e.target.value,
+                                )
+                            }
+                        />
                         {translationEngine === "local" && (
                             <p className='text-xs text-slate-400 mb-2'>
                                 服务端模型需先下载：npm run fetch-model --{" "}
                                 {currentTranslationModel ||
                                     "Xenova/nllb-200-distilled-600M"}
-                            </p>
-                        )}
-                        {translationEngine === "api" && (
-                            <p className='text-xs text-slate-400 mb-2'>
-                                Server API 翻译复用左侧 Server API 的 Base URL
-                                与 API Key，请求经本地服务端中转。
                             </p>
                         )}
                     </section>

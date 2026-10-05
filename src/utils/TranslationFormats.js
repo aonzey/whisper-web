@@ -118,6 +118,8 @@ export function buildTranslationPrompt({
     context,
     sourceLanguage,
     targetLanguage,
+    /** Free-form instructions the user typed into Settings. */
+    extraPrompt,
 }) {
     const src = languageLabel(sourceLanguage || "") || "the source language";
     const tgt = languageLabel(targetLanguage) || targetLanguage;
@@ -138,6 +140,11 @@ export function buildTranslationPrompt({
                   .join("\n")}\n\n`
             : "";
 
+    const extra = String(extraPrompt ?? "").trim();
+    const extraBlock = extra
+        ? `用户补充要求（必须遵守，但不能破坏上面的输出格式）：\n${extra}\n\n`
+        : "";
+
     return (
         `你是专业的字幕翻译引擎。请把下面编号的字幕从 ${src} 翻译成 ${tgt}。\n` +
         `严格要求：\n` +
@@ -148,6 +155,7 @@ export function buildTranslationPrompt({
         `3. 不要输出序号以外的任何解释、标题或代码块；\n` +
         `4. 保留原文的换行结构，不要合并或拆分行。\n\n` +
         contextBlock +
+        extraBlock +
         `需要翻译的字幕：\n${numbered}`
     );
 }

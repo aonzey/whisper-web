@@ -2,7 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useWorker } from "./useWorker";
 import Constants from "../utils/Constants";
 import { audioBufferToWav } from "../utils/AudioUtils";
-import { transcribeViaApi } from "../utils/ApiClient";
+import {
+    SELF_API_BASE,
+    classifyApiBase,
+    transcribeViaApi,
+} from "../utils/ApiClient";
 import {
     TranslationEngine,
     translateLinesWithContext,
@@ -135,6 +139,17 @@ export interface Transcriber {
     translationApiModel: string;
     setTranslationApiModel: (model: string) => void;
     /**
+     * Server API endpoint used *only* by the translation engine — it does not
+     * share the transcription side's Base URL / key / model.
+     */
+    translationApiBaseUrl: string;
+    setTranslationApiBaseUrl: (url: string) => void;
+    translationApiKey: string;
+    setTranslationApiKey: (key: string) => void;
+    /** Extra instructions appended to the LLM prompt (Server API only). */
+    translationPrompt: string;
+    setTranslationPrompt: (prompt: string) => void;
+    /**
      * Translate a transcript that is already on screen — the "Bilingual
      * subtitles" button calls this instead of transcribing the audio again.
      */
@@ -253,11 +268,15 @@ export function useTranscriber(): Transcriber {
         Constants.DEFAULT_LANGUAGE,
     );
 
-    // "local" used to mean the in-browser model; that is called "browser" now.
+    // NOTE: "local" used to mean the in-browser model in an older version;
+    // that is "browser" now and "local" is the server side engine. Persist and
+    // restore all three values as-is, otherwise picking the local engine in
+    // Settings silently falls back to the browser engine after a reload.
     const [engine, setEngineState] = useState<Engine>(() => {
         const stored = loadSetting("engine", Constants.DEFAULT_ENGINE);
-        if (stored === "local") return "browser";
-        return stored === "api" || stored === "browser" ? stored : "browser";
+        return stored === "api" || stored === "local" || stored === "browser"
+            ? stored
+            : "browser";
     });
     const [apiBaseUrl, setApiBaseUrlState] = useState<string>(
         loadSetting("apiBaseUrl", Constants.API_BASE_URL),
@@ -294,6 +313,19 @@ export function useTranscriber(): Transcriber {
             "translationApiModel",
             Constants.DEFAULT_TRANSLATION_API_MODEL,
         ),
+    );
+    const [translationApiBaseUrl, setTranslationApiBaseUrlState] =
+        useState<string>(
+            loadSetting(
+                "translationApiBaseUrl",
+                Constants.TRANSLATION_API_BASE_URL,
+            ),
+        );
+    const [translationApiKey, setTranslationApiKeyState] = useState<string>(
+        loadSetting("translationApiKey", Constants.TRANSLATION_API_KEY),
+    );
+    const [translationPrompt, setTranslationPromptState] = useState<string>(
+        loadSetting("translationPrompt", Constants.TRANSLATION_PROMPT),
     );
 
     const [isTranslating, setIsTranslating] = useState(false);
@@ -341,6 +373,18 @@ export function useTranscriber(): Transcriber {
         saveSetting("translationApiModel", value);
         setTranslationApiModelState(value);
     }, []);
+    const setTranslationApiBaseUrl = useCallback((value: string) => {
+        saveSetting("translationApiBaseUrl", value);
+        setTranslationApiBaseUrlState(value);
+    }, []);
+    const setTranslationApiKey = useCallback((value: string) => {
+        saveSetting("translationApiKey", value);
+        setTranslationApiKeyState(value);
+    }, []);
+    const setTranslationPrompt = useCallback((value: string) => {
+        saveSetting("translationPrompt", value);
+        setTranslationPromptState(value);
+    }, []);
 
     /**
      * Translate every chunk in place (context aware: the previous lines are
@@ -352,6 +396,15 @@ export function useTranscriber(): Transcriber {
             setIsTranslating(true);
             setTranslationProgress({ done: 0, total: chunks.length });
             try {
+                // The translation side has its own endpoint / key / model and
+                // never borrows the transcription ones. The `local` engine
+                // always runs on our own server, even if the field points at
+                // a third party host.
+                const translationBase =
+                    translationEngine === "local" &&
+                    classifyApiBase(translationApiBaseUrl).kind !== "self"
+                        ? SELF_API_BASE
+                        : translationApiBaseUrl;
                 const lines = chunks.map((chunk) => chunk.text ?? "");
                 const translations = await translateLinesWithContext({
                     engine: translationEngine,
@@ -364,8 +417,9 @@ export function useTranscriber(): Transcriber {
                         translationEngine === "api"
                             ? translationApiModel
                             : translationModel,
-                    baseUrl: apiBaseUrl,
-                    apiKey: apiKey,
+                    baseUrl: translationBase,
+                    apiKey: translationApiKey,
+                    prompt: translationPrompt,
                     lines,
                     onProgress: (done, total) =>
                         setTranslationProgress({ done, total }),
@@ -384,8 +438,9 @@ export function useTranscriber(): Transcriber {
             translationTarget,
             translationModel,
             translationApiModel,
-            apiBaseUrl,
-            apiKey,
+            translationApiBaseUrl,
+            translationApiKey,
+            translationPrompt,
             multilingual,
             language,
         ],
@@ -682,6 +737,12 @@ export function useTranscriber(): Transcriber {
             setTranslationModel,
             translationApiModel,
             setTranslationApiModel,
+            translationApiBaseUrl,
+            setTranslationApiBaseUrl,
+            translationApiKey,
+            setTranslationApiKey,
+            translationPrompt,
+            setTranslationPrompt,
         };
     }, [
         isBusy,
@@ -718,6 +779,12 @@ export function useTranscriber(): Transcriber {
         setTranslationModel,
         translationApiModel,
         setTranslationApiModel,
+        translationApiBaseUrl,
+        setTranslationApiBaseUrl,
+        translationApiKey,
+        setTranslationApiKey,
+        translationPrompt,
+        setTranslationPrompt,
     ]);
 
     return transcriber;

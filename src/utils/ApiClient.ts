@@ -229,14 +229,35 @@ function humanSize(bytes?: number) {
     return mb >= 1024 ? `${(mb / 1024).toFixed(1)}GB` : `${Math.round(mb)}MB`;
 }
 
+export interface FetchModelsOptions {
+    baseUrl: string;
+    apiKey?: string;
+    /**
+     * Which Settings column is asking:
+     *   "asr"         -> whisper family (the transcription dropdown)
+     *   "translation" -> opus-mt / nllb / ... (the translation dropdown)
+     * Omit to receive every cached model.
+     */
+    task?: "asr" | "translation";
+}
+
 /**
  * Ask the server which models it can actually run (cached weights + aliases).
  * Never rejects — inspect `ok` / `error` instead so the UI can explain itself.
  */
 export async function fetchApiModels(
-    baseUrl: string,
-    apiKey?: string,
+    options: FetchModelsOptions | string,
+    legacyApiKey?: string,
+    legacyTask?: "asr" | "translation",
 ): Promise<{ ok: boolean; options: ApiModelOption[]; error?: string }> {
+    const { baseUrl, apiKey, task } =
+        typeof options === "string"
+            ? {
+                  baseUrl: options,
+                  apiKey: legacyApiKey,
+                  task: legacyTask,
+              }
+            : options;
     const target = classifyApiBase(baseUrl);
     try {
         // Third party endpoint → list its own models through our server.
@@ -251,21 +272,29 @@ export async function fetchApiModels(
             const models: string[] = Array.isArray(data?.models)
                 ? data.models
                 : [];
+            // A chat model is what the translation column wants; the
+            // transcription column needs audio models.
+            const audioLike = task !== "translation";
+            const filtered = audioLike
+                ? models
+                : models.filter((id) => !/whisper|distil/i.test(id));
             return {
                 ok: true,
-                options: models.map((id) => ({
+                options: filtered.map((id) => ({
                     id,
                     note: /whisper|asr|audio|distil/i.test(id)
                         ? "上游语音模型"
                         : "上游模型（非语音）",
                     cached: false,
                     kind: "remote" as const,
+                    task: "",
                 })),
             };
         }
 
         const { data } = await axios.get(joinUrl(target.baseUrl, "/models"), {
             headers: authHeaders(apiKey),
+            params: task ? { task } : undefined,
             timeout: 8000,
         });
 
