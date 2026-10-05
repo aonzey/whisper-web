@@ -939,6 +939,16 @@ function SettingsModal(props: {
     // "/api" (our own server) vs. a third party OpenAI compatible endpoint.
     const apiTarget = classifyApiBase(props.transcriber.apiBaseUrl);
 
+    // The local engine always runs in *our* Node server. A third party base url
+    // (typed while "Server API" was selected) must not leak into it — otherwise
+    // the model dropdown lists upstream chat models instead of the whisper
+    // weights cached in `.cache/Transcription models`.
+    const asrBaseUrl =
+        isServerLocal && apiTarget.kind !== "self"
+            ? SELF_API_BASE
+            : props.transcriber.apiBaseUrl;
+    const asrTarget = classifyApiBase(asrBaseUrl);
+
     // The translation engine talks to its own endpoint. The `local` engine
     // always runs on our own server, even when the field points elsewhere.
     const translationBaseUrl =
@@ -969,8 +979,10 @@ function SettingsModal(props: {
 
     /** Transcription column: whisper family models cached on the server. */
     const loadAsrModels = useCallback(async () => {
-        // Listing a third party endpoint's models needs its key.
-        if (apiTarget.kind === "openai" && !props.transcriber.apiKey) {
+        // Listing a third party endpoint's models needs its key. The local
+        // engine never hits a third party (see `asrBaseUrl`), so it always
+        // lists the weights cached on our own server.
+        if (asrTarget.kind === "openai" && !props.transcriber.apiKey) {
             setAsrModels([]);
             setAsrStatus(
                 "第三方端点：填写上面的 API Key 后点「刷新列表」拉取上游模型",
@@ -980,7 +992,9 @@ function SettingsModal(props: {
         setAsrLoading(true);
         setAsrStatus("正在读取服务端转写模型列表...");
         const result = await fetchApiModels({
-            baseUrl: props.transcriber.apiBaseUrl,
+            baseUrl: asrBaseUrl,
+            // With `asrBaseUrl` forced to our own server the key is the
+            // server's API_TOKEN (harmless when the server has none).
             apiKey: props.transcriber.apiKey,
             task: "asr",
         });
@@ -996,16 +1010,12 @@ function SettingsModal(props: {
         } else {
             setAsrModels([]);
             setAsrStatus(
-                apiTarget.kind === "openai"
+                asrTarget.kind === "openai"
                     ? `无法读取上游模型列表（${result.error}），以下为常见模型名`
-                    : `无法读取服务端模型列表（${result.error}），以下为内置别名`,
+                    : `无法读取服务端模型列表（${result.error}）。本地引擎需要 npm run server 启动服务端（默认 8787），以下为内置别名`,
             );
         }
-    }, [
-        apiTarget.kind,
-        props.transcriber.apiBaseUrl,
-        props.transcriber.apiKey,
-    ]);
+    }, [asrTarget.kind, asrBaseUrl, isServerLocal, props.transcriber.apiKey]);
 
     /**
      * Translation column: translation models cached on the server, or the
@@ -1153,9 +1163,9 @@ function SettingsModal(props: {
             // The chat endpoint cannot run 🤗 weights — say so instead of
             // silently offering an unusable model.
             note:
-                translationEngine === "api"
-                    ? "已缓存（🤗 模型，需切换到本地引擎）"
-                    : "已缓存（服务端）",
+                translationEngine === "local"
+                    ? "已缓存（服务端 .cache\\Translation models）"
+                    : "已缓存（服务端 · 需切换到本地引擎才能用）",
             multilingual: true,
             size: "",
         }));
@@ -1240,7 +1250,10 @@ function SettingsModal(props: {
                             </p>
                         )}
 
-                        {usesServer ? (
+                        {/* The local engine needs no endpoint: it always runs
+                            inside our own Node server, so the base url / key /
+                            test button belong to "Server API" only. */}
+                        {isApi && (
                             <>
                                 <label>API base URL</label>
                                 <input
@@ -1275,12 +1288,18 @@ function SettingsModal(props: {
                                         )
                                     }
                                 />
+                            </>
+                        )}
+
+                        {usesServer ? (
+                            <>
                                 <div className='flex items-center justify-between'>
                                     <label>
                                         Model
                                         {isServerLocal && (
                                             <span className='text-xs text-slate-400'>
-                                                （可用服务端已缓存的本地模型）
+                                                （.cache\Transcription models
+                                                中已缓存的模型）
                                             </span>
                                         )}
                                     </label>
@@ -1366,29 +1385,29 @@ function SettingsModal(props: {
                                         </optgroup>
                                     </select>
                                 )}
-                                {asrStatus && (
-                                    <p
-                                        className={`text-xs mb-2 ${
-                                            asrModels.length
-                                                ? "text-slate-400"
-                                                : "text-amber-600"
-                                        }`}
-                                    >
-                                        {asrStatus}
+                                {isApi && (
+                                    <div className='flex items-center space-x-2 mb-2'>
+                                        <button
+                                            onClick={onTestApi}
+                                            disabled={testing}
+                                            className='text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 rounded-lg text-xs px-3 py-1.5'
+                                        >
+                                            Test connection
+                                        </button>
+                                        <span className='text-xs text-slate-500 break-all'>
+                                            {apiStatus}
+                                        </span>
+                                    </div>
+                                )}
+                                {isServerLocal && (
+                                    <p className='text-xs text-slate-400 mb-2 break-all'>
+                                        模型需先下载到服务端：npm run
+                                        fetch-model --{" "}
+                                        {currentModel || "tiny.en"}
+                                        （缓存目录 .cache\Transcription
+                                        models）；点「刷新列表」可立即看到新下载的模型。
                                     </p>
                                 )}
-                                <div className='flex items-center space-x-2 mb-2'>
-                                    <button
-                                        onClick={onTestApi}
-                                        disabled={testing}
-                                        className='text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 rounded-lg text-xs px-3 py-1.5'
-                                    >
-                                        Test connection
-                                    </button>
-                                    <span className='text-xs text-slate-500 break-all'>
-                                        {apiStatus}
-                                    </span>
-                                </div>
                             </>
                         ) : (
                             <>
@@ -1758,28 +1777,32 @@ function SettingsModal(props: {
                             </>
                         )}
 
-                        <label>
-                            Prompt（补充要求）
-                            <span className='text-xs text-slate-400'>
-                                {translationEngine === "api"
-                                    ? "（追加到翻译提示词，仅 Server API 生效）"
-                                    : "（仅 Server API 引擎生效）"}
-                            </span>
-                        </label>
-                        <textarea
-                            className={inputClass}
-                            rows={3}
-                            value={props.transcriber.translationPrompt}
-                            placeholder={
-                                "例如：使用简体中文口语化表达；人名保留原文；" +
-                                "“Transformer”统一译为“变换器”"
-                            }
-                            onChange={(e) =>
-                                props.transcriber.setTranslationPrompt(
-                                    e.target.value,
-                                )
-                            }
-                        />
+                        {/* The extra prompt is appended to the LLM prompt, so it
+                            only exists for the Server API engine. */}
+                        {translationEngine === "api" && (
+                            <>
+                                <label>
+                                    Prompt（补充要求）
+                                    <span className='text-xs text-slate-400'>
+                                        （追加到翻译提示词，仅 Server API 生效）
+                                    </span>
+                                </label>
+                                <textarea
+                                    className={inputClass}
+                                    rows={3}
+                                    value={props.transcriber.translationPrompt}
+                                    placeholder={
+                                        "例如：使用简体中文口语化表达；人名保留原文；" +
+                                        "“Transformer”统一译为“变换器”"
+                                    }
+                                    onChange={(e) =>
+                                        props.transcriber.setTranslationPrompt(
+                                            e.target.value,
+                                        )
+                                    }
+                                />
+                            </>
+                        )}
                         {translationEngine === "local" && (
                             <p className='text-xs text-slate-400 mb-2'>
                                 服务端模型需先下载：npm run fetch-model --{" "}

@@ -216,9 +216,9 @@ Settings 弹窗**左右并列两栏**：左边 `Transcription engine`，右边
 | **Model** | 下拉框。服务端引擎下由 `GET /api/models` 填充（只列 `task=asr` 的模型），分两组：<br>· **已缓存（服务端可直接用）** —— 权重已在 `.cache/Transcription models`，带精度与体积<br>· **其他可填的模型 / 别名** —— 未下载，选中会触发下载或报不可用 |
 | **刷新列表** | 重新拉取 `/api/models?task=asr`（下完新模型后点它）。左栏只列转写模型，状态行会直接把已缓存的 id 列出来 |
 | **手动输入** | 切换成文本框，可填写列表里没有的模型 id |
-| **Base URL** | 默认 `/api`（vite 已代理到 8787）。也可填第三方 OpenAI 兼容端点，如 `https://api.groq.com/openai/v1`（见[下节](#接入第三方-openai-兼容端点groq--dashscope-)）。下方会实时显示识别结果 |
-| **API Key** | 服务端设了 `API_TOKEN` 时才需要 |
-| **Test connection** | 打 `/api/health`，会回显服务端当前引擎与模型 |
+| **Base URL** | **仅 Server API 显示**。默认 `/api`（vite 已代理到 8787）。也可填第三方 OpenAI 兼容端点，如 `https://api.groq.com/openai/v1`（见[下节](#接入第三方-openai-兼容端点groq--dashscope-)）。下方会实时显示识别结果 |
+| **API Key** | **仅 Server API 显示**。服务端设了 `API_TOKEN` 时才需要 |
+| **Test connection** | **仅 Server API 显示**。打 `/api/health`，会回显服务端当前引擎与模型 |
 | **Multilingual** | 勾选后可指定语言与 `translate` 任务 |
 | **Language** | 源语言；`auto` 为自动检测 |
 | **Task** | `transcribe`（原语言）或 `translate`（译成英文） |
@@ -236,13 +236,19 @@ Settings 弹窗**左右并列两栏**：左边 `Transcription engine`，右边
 | **Translation API base URL** | 仅 Server API 显示。**与左侧完全独立**，默认 `/api`。填第三方地址时经本地服务端中转 |
 | **Translation API key** | 仅 Server API 显示。第三方端点必填；只走自有服务端且设了 `API_TOKEN` 时填同一个 token |
 | **Test connection** | 只探测右栏自己的端点（第三方端点走 `/api/upstream/health`） |
-| **Prompt（补充要求）** | 追加到 LLM 翻译提示词的自定义指令（如「人名保留原文」「口语化表达」）。**仅 Server API 引擎生效**，🤗 模型会忽略 |
+| **Prompt（补充要求）** | **仅 Server API 显示**。追加到 LLM 翻译提示词的自定义指令（如「人名保留原文」「口语化表达」）。🤗 模型（Browser / 本地引擎）会忽略，因此那两个引擎下不显示该输入框 |
 
 两栏各拉各的、各显示各的：左栏请求 `?task=asr`，右栏请求
 `?task=translation`。`/api/models` 先读 `config.json` 的 `model_type`、
 读不到再按缓存子目录（`Transcription models` / `Translation models`）
 给每个模型打 `asr` / `translation` 标签，因此转写框里不会出现 `opus-mt`
 这类翻译模型，反之亦然。
+
+> **本地引擎不需要端点**：选「本地引擎 Local engine (server)」时，Base URL /
+> API Key / Test connection 三项会整块隐藏，模型列表**固定**去问自有服务端
+> （`GET /api/models?task=asr`）。即使之前在 Server API 下填过第三方地址，
+> 切回本地引擎也不会拿上游模型列表覆盖本机 `.cache/Transcription models`
+> 的缓存清单，转写请求同样强制发往自有服务端。
 
 所有设置存 `localStorage`（前缀 `whisper-web:`），刷新不丢。
 

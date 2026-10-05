@@ -554,7 +554,13 @@ export function useTranscriber(): Transcriber {
                 const name = fileName ?? (file ? "audio" : "audio.wav");
 
                 const result = await transcribeViaApi({
-                    baseUrl: apiBaseUrl,
+                    // The local engine lives in our own Node server — never
+                    // relay it to a third party base url typed for "Server API".
+                    baseUrl:
+                        engine === "local" &&
+                        classifyApiBase(apiBaseUrl).kind !== "self"
+                            ? SELF_API_BASE
+                            : apiBaseUrl,
                     apiKey: apiKey,
                     model: engine === "local" ? localModel : apiModel,
                     // "local" pins the server to its in-process engine;
