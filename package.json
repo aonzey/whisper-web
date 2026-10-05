@@ -14,7 +14,9 @@
     "tsc": "tsc",
     "server": "node server/index.js",
     "dev:all": "node scripts/dev-all.js",
-    "fetch-model": "node scripts/fetch-local-model.mjs"
+    "fetch-model": "node scripts/fetch-local-model.mjs",
+    "cli": "node scripts/cli.mjs",
+    "bilingual": "node scripts/cli.mjs bilingual"
   },
   "dependencies": {
     "@headlessui/react": "^1.7.13",

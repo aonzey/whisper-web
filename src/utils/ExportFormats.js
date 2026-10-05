@@ -45,16 +45,39 @@ export function formatSrtTimestamp(time) {
     )}`;
 }
 
-/** Merge every chunk into a single plain-text transcript. */
-export function chunksToText(chunks) {
-    return (chunks || [])
-        .map((chunk) => chunk.text ?? "")
-        .join("")
+/** Does any chunk carry a translation? */
+export function isBilingual(chunks) {
+    return (chunks || []).some(
+        (chunk) => String(chunk?.trans ?? "").trim().length > 0,
+    );
+}
+
+function lineOf(chunk, bilingual) {
+    const text = String(chunk?.text ?? "");
+    if (!bilingual) return text;
+    const trans = String(chunk?.trans ?? "").trim();
+    return trans ? `${text.trim()}\n${trans}` : text.trim();
+}
+
+/**
+ * Merge every chunk into a plain-text transcript.
+ * With `bilingual` each source line is followed by its translation.
+ */
+export function chunksToText(chunks, options) {
+    const bilingual = Boolean(options?.bilingual);
+    const list = chunks || [];
+    return list
+        .map((chunk) => lineOf(chunk, bilingual))
+        .join(bilingual ? "\n" : "")
         .trim();
 }
 
-/** Serialize chunks to a SubRip (.srt) subtitle file. */
-export function chunksToSRT(chunks) {
+/**
+ * Serialize chunks to a SubRip (.srt) subtitle file.
+ * With `bilingual` every cue holds the original line plus its translation.
+ */
+export function chunksToSRT(chunks, options) {
+    const bilingual = Boolean(options?.bilingual);
     const list = chunks || [];
     return list
         .map((chunk, i) => {
@@ -65,7 +88,7 @@ export function chunksToSRT(chunks) {
                 chunk.timestamp?.[1] ??
                 list[i + 1]?.timestamp?.[0] ??
                 start + 2;
-            const text = String(chunk.text ?? "").trim();
+            const text = lineOf(chunk, bilingual).trim();
             return `${i + 1}\n${formatSrtTimestamp(
                 start,
             )} --> ${formatSrtTimestamp(Math.max(end, start))}\n${text}\n`;
@@ -91,18 +114,21 @@ export function chunksToJSON(chunks) {
     return jsonData.replace(regex, "$1[$2 $3]");
 }
 
-/** Body, mime type and file extension of one export format. */
-export function exportContent(chunks, format) {
+/**
+ * Body, mime type and file extension of one export format.
+ * `options.bilingual` puts the translation next to every source line.
+ */
+export function exportContent(chunks, format, options) {
     switch (String(format || "").toLowerCase()) {
         case "txt":
             return {
-                body: chunksToText(chunks),
+                body: chunksToText(chunks, options),
                 mime: "text/plain; charset=utf-8",
                 ext: "txt",
             };
         case "srt":
             return {
-                body: chunksToSRT(chunks),
+                body: chunksToSRT(chunks, options),
                 mime: "application/x-subrip; charset=utf-8",
                 ext: "srt",
             };

@@ -39,4 +39,10 @@ export default {
     API_BASE_URL: "/api",
     API_MODEL: "whisper-1",
     LOCAL_MODEL: "tiny.en",
+
+    // Translation (used by the "Bilingual subtitles" button)
+    DEFAULT_TRANSLATION_ENGINE: "browser",
+    DEFAULT_TRANSLATION_TARGET: "zh",
+    DEFAULT_TRANSLATION_MODEL: "Xenova/nllb-200-distilled-600M",
+    DEFAULT_TRANSLATION_API_MODEL: "gpt-4o-mini",
 };

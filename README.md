@@ -25,13 +25,18 @@
   - [4. 批量转写与批量导出](#4-批量转写与批量导出)
   - [5. 导出格式与 trans 字段](#5-导出格式与-trans-字段)
   - [6. Settings 面板逐项说明](#6-settings-面板逐项说明)
+  - [7. 字幕联动：实时高亮 + 点击跳转](#7-字幕联动实时高亮--点击跳转)
+  - [8. 双语字幕 Bilingual subtitles](#8-双语字幕-bilingual-subtitles)
 - [下载本地模型权重](#下载本地模型权重fetch-model)
 - [API 服务端](#api-服务端)
   - [接口一览](#接口一览)
   - [转写参数](#post-apitranscribe-参数)
   - [返回格式 txt / srt / json](#返回格式txt--srt--json)
   - [curl 示例](#curl-示例)
+  - [POST /api/bilingual 双语](#post-apibilingual-双语)
+  - [POST /api/translate 单独翻译](#post-apitranslate-单独翻译)
   - [环境变量](#环境变量)
+- [命令行 CLI](#命令行-cli)
 - [项目结构](#项目结构)
 - [开发命令](#开发命令)
 - [避坑指南](#避坑指南)
@@ -186,6 +191,18 @@ ask what you can do for your country.
 > 最后一段若只有起始时间，结束时间会退化为「下一段起点」，再退化为 `start + 2s`，
 > 不会出现 0 长度字幕。
 
+**双语结果**：只要某条 chunk 的 `trans` 非空（即跑过 *Bilingual subtitles*），
+导出自动切换为双语：
+
+| 格式 | 双语表现 |
+| --- | --- |
+| `.txt` | 每句原文后紧跟一行译文 |
+| `.srt` | 每个 cue 里原文一行 + 译文一行（时间轴不变） |
+| `.json` | 每句 `trans` 字段带上译文 |
+
+双语时 TXT / SRT 的文件名会追加 `.bilingual`（如 `demo.bilingual.srt`），
+便于和单语版本区分；JSON 结构不变，靠 `trans` 字段区分。
+
 ### 6. Settings 面板逐项说明
 
 | 设置项 | 说明 |
@@ -201,8 +218,67 @@ ask what you can do for your country.
 | **Language** | 源语言；`auto` 为自动检测 |
 | **Task** | `transcribe`（原语言）或 `translate`（译成英文） |
 | **Quantized** | 浏览器引擎用量化模型（更小更快，精度略降） |
+| **Translation engine** | `Browser (in-browser model)` / `本地引擎 Local engine (server)` / `Server API`，见[第 8 节](#8-双语字幕-bilingual-subtitles) |
+| **Translate subtitles into** | 目标语言，80+ 种可选（含简体/繁体中文） |
+| **Translation model** | 浏览器/本地引擎选 🤗 翻译模型；Server API 选聊天模型 |
 
 所有设置存 `localStorage`（前缀 `whisper-web:`），刷新不丢。
+
+---
+
+## 7. 字幕联动：实时高亮 + 点击跳转
+
+转写结果出来后，字幕列表与播放器是双向联动的：
+
+- **播放时**：按当前播放时间定位所属字幕块，自动 `scrollIntoView` 并高亮
+  （底色变蓝、时间码加粗）；滚到最后一句后保持高亮最后一句。
+- **点击任意一行**：音频立刻跳到该句起点并从那里开始播放
+  （浏览器可能因自动播放策略拦下首次播放，点一下播放器即可）。
+- 转写进行中（流式输出）仍然保持「贴底滚动」，不会和高亮冲突。
+
+> 时间轴来自 chunk 的 `timestamp`；最后一段只有起点时按
+> 「下一段起点 → start + 2s」兜底，与导出规则一致。
+
+---
+
+## 8. 双语字幕 Bilingual subtitles
+
+`Transcribe Audio` 按钮旁边就是 `Bilingual subtitles`（批量时为
+`Bilingual All (N)`）。它做两件事：
+
+1. 先完整跑一遍普通转写（用的就是当前 *Transcription engine* 的设置）；
+2. 再按 *Translation engine* 的设置把每句译文填进 `chunk.trans`，
+   **按上下文分批翻译**——每批最多 10 句，且把已译好的前 4 句一起交给引擎，
+   保证代词、人名、术语前后一致。
+
+界面与导出：
+
+- 列表每句显示两行：原文 + 译文；
+- 三个 Export 按钮全部导出双语内容（见[第 5 节](#5-导出格式与-trans-字段)）；
+- 批量模式下也是「每个文件转写 → 翻译 → 再下一个文件」。
+
+### 三种 Translation engine 怎么选
+
+| 选项 | 跑在哪 | 适用 | 准备 |
+| --- | --- | --- | --- |
+| **Browser (in-browser model)** | 浏览器 Web Worker 里的 🤗 Transformers.js | 不想起服务端、机器内存够 | 首次自动下载所选模型（默认 `Xenova/nllb-200-distilled-600M`，约 250MB） |
+| **本地引擎 Local engine (server)** | Node 服务端进程内 | 完全离线、想复用服务端缓存 | `npm run fetch-model -- Xenova/opus-mt-en-zh` |
+| **Server API** | OpenAI 兼容的 `/chat/completions` | **上下文语境翻译质量最好** | 填好 Base URL + API Key + 聊天模型（复用 Server API 的设置） |
+
+- 浏览器/本地引擎用 🤗 翻译模型（`Xenova/nllb-200-distilled-600M`、
+  `Xenova/m2m100_418M`、`Xenova/opus-mt-en-zh` 等），NLLB / m2m100 / mBART
+  会自动带上 `src_lang` / `tgt_lang` 语言码。
+- Server API 走 LLM：提示词要求「按 `<序号>\t<译文>` 逐行输出」，
+  解析失败会退化为按行对齐，保证句数不错位。
+- 翻译期间按钮显示 `Translating... n/N`，进度条按句推进。
+
+> 浏览器依然**不能直连**第三方端点（CORS + 不走系统代理），
+> Server API 的请求统一经本地服务端中转。
+>
+> `/api/models` 会按 `config.json` 的 `model_type` 给每个缓存模型打上
+> `task`（`asr` / `translation`），因为 opus-mt / NLLB 这类翻译模型同样带
+> `encoder_model*.onnx`。转写模型的下拉框会过滤掉翻译模型，
+> 翻译模型的下拉框会把「已缓存（服务端）」的排在最前面。
 
 ---
 
@@ -213,10 +289,40 @@ ask what you can do for your country.
 ```bash
 npm run fetch-model                              # Xenova/whisper-tiny.en（量化，约 42MB）
 npm run fetch-model -- Xenova/whisper-small      # 指定模型（约 242MB）
+npm run fetch-model -- onnx-community/whisper-tiny   # 任意组织/用户的仓库
+npm run fetch-model -- Xenova/opus-mt-en-zh      # 翻译模型（通用 ONNX 布局）
+npm run fetch-model -- zem214/whisper-medium --list   # 只看这个仓库里有什么文件
 npm run fetch-model -- --full                    # 连 fp32 权重一起下（体积翻倍）
 npm run fetch-model -- --force                   # 已存在也重新下载
+npm run fetch-model -- --dry-run                 # 只打印将要下载什么
 npm run fetch-model -- --mirror https://hf-mirror.com/
+npm run fetch-model -- --revision main           # 指定分支 / commit
 ```
+
+**任意仓库都能下（不再只支持 Xenova/*）**。脚本会先用仓库 API 列出文件
+（Hugging Face `/api/models/<id>/tree/<rev>`、ModelScope
+`/api/v1/models/<id>/repo/files`），再从中挑出配置与权重，并**归一化**到
+transformers.js 期望的布局：
+
+| 仓库里的文件 | 落到缓存的位置 |
+| --- | --- |
+| `config.json` / `generation_config.json` / `tokenizer*.json` … | 同名放根目录 |
+| `onnx/encoder_model_quantized.onnx`、`encoder_model_int8.onnx`、… | `onnx/encoder_model_quantized.onnx` |
+| `onnx/decoder_model_merged_quantized.onnx`、`…_int8`、… | `onnx/decoder_model_merged_quantized.onnx` |
+| 非 Whisper 的通用模型（`model.onnx` 命名） | `onnx/model[_quantized].onnx` |
+
+找不到 encoder/decoder 时会按「通用 ONNX 模型」处理，并提示
+`[info] 未找到 Whisper 风格的 encoder/decoder`，这正是下载翻译模型时的正常输出。
+
+**常见失败原因**（都会精确打印，不再只说 “download failed”）：
+
+| 现象 | 原因与处理 |
+| --- | --- |
+| `modelscope: HTTP 404 …记录不存在` | 该仓库**没有同步到 ModelScope**（如 `zem214/whisper-medium`）。换 `--mirror https://hf-mirror.com/` 或设 `HF_ENDPOINT` |
+| `huggingface: fetch failed` | huggingface.co 在本机不可达。同上，换镜像 |
+| `缺少 decoder_model_merged*.onnx` | 该仓库只有未合并的 `decoder_model.onnx`，transformers.js 用不了，需要重新导出 |
+| 仓库全是 `.bin` / `.safetensors` | 只有 PyTorch 权重，需先转 ONNX |
+| 只有 fp32 权重 | 会保存为 `onnx/*.onnx`（不带 `_quantized`），服务端自动以非量化方式加载 |
 
 - 输出目录：`<LOCAL_CACHE_DIR|./.cache>/<model_id>/<file>`，正好是
   transformers.js `FileSystemCache` 的布局。
@@ -259,7 +365,10 @@ whisper-web API listening on http://localhost:8787
 | `GET` | `/api/health` | 健康检查：引擎、模型、代理、已缓存模型、是否需鉴权 |
 | `GET` | `/api/models` | 本服务端可用模型（已缓存 + 别名 + 远端模型） |
 | `POST` | `/api/transcribe` | 上传音频转写 |
-| `POST` | `/v1/audio/transcriptions` | 上一行的 OpenAI 兼容别名 |
+| `POST` | `/api/bilingual` | 转写 **+ 翻译**，返回双语结果 |
+| `POST` | `/api/translate` | 只翻译：`{ lines, target_language }` → `{ translations }` |
+| `POST` | `/v1/audio/transcriptions` | `/api/transcribe` 的 OpenAI 兼容别名 |
+| `POST` | `/v1/audio/bilingual` | `/api/bilingual` 的别名 |
 | `GET` | `/api/upstream/models` | 查询**第三方**端点的模型列表（`baseUrl` / `apiKey`） |
 | `GET` | `/api/upstream/health` | 探活第三方端点（同上参数） |
 
@@ -363,6 +472,74 @@ curl.exe -s -F "file=@Excuse Me.mp3" -F "model=tiny.en" http://localhost:8787/ap
 > PowerShell 的 `curl` 是 `Invoke-WebRequest` 的别名，**不支持 `-F`**，
 > 请写 `curl.exe`。
 
+### `POST /api/bilingual` 双语
+
+参数 = [`POST /api/transcribe` 的全部参数](#post-apitranscribe-参数) +
+下面这些（同样既支持 form 字段也支持 query）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `target_language` / `targetLanguage` | 目标语言 id，如 `zh`、`zh-Hant`、`en`、`ja`。默认 `TRANSLATION_TARGET` 或 `zh` |
+| `source_language` / `sourceLanguage` | 源语言提示，缺省用转写返回的 `language` |
+| `translation_engine` / `translationEngine` | `local`（🤗 翻译模型）或 `openai`（聊天模型）。填了 `upstream_base_url` 时默认 `openai`，否则 `local` |
+| `translation_model` / `translationModel` | 翻译模型 / 聊天模型 id，缺省分别为 `TRANSLATION_MODEL`、`TRANSLATION_API_MODEL` |
+
+```bash
+# 本地引擎转写 + 本地翻译模型，直接要双语 SRT
+curl -sOJ --noproxy '*' -F "file=@demo.mp3" -F "engine=local" -F "model=tiny.en" \
+     -F "translation_engine=local" -F "translation_model=Xenova/opus-mt-en-zh" \
+     -F "target_language=zh" \
+     "http://localhost:8787/api/bilingual?format=srt&download=1"
+
+# 用 Groq 的聊天模型做上下文翻译（转写走本地，翻译走 LLM）
+curl -s --noproxy '*' -F "file=@demo.mp3" -F "engine=local" -F "model=tiny.en" \
+     -F "translation_engine=openai" \
+     -F "upstream_base_url=https://api.groq.com/openai/v1" \
+     -F "upstream_api_key=gsk_xxx" -F "translation_model=llama-3.3-70b-versatile" \
+     -F "target_language=zh" http://localhost:8787/api/bilingual
+```
+
+返回（不带 `response_format` 时）会在普通结果上多一个 `translation` 字段：
+
+```json
+{
+  "text": " Hello world.",
+  "chunks": [
+    { "timestamp": [0, 2], "text": " Hello world.", "trans": "你好世界。" }
+  ],
+  "engine": "local",
+  "model": "tiny.en",
+  "translation": {
+    "engine": "local",
+    "model": "Xenova/opus-mt-en-zh",
+    "target_language": "zh",
+    "label": "Chinese (Simplified)"
+  }
+}
+```
+
+带 `response_format=txt|srt|json` 时返回的就是[双语导出内容](#5-导出格式与-trans-字段)，
+与页面 Export 按钮下载到的文件**逐字节一致**。
+
+### `POST /api/translate` 单独翻译
+
+只想翻译文本、不想碰音频时用这个（页面翻译走的也是它）：
+
+```bash
+curl -s --noproxy '*' -X POST http://localhost:8787/api/translate \
+     -H "Content-Type: application/json" \
+     -d '{
+           "engine": "local",
+           "model": "Xenova/opus-mt-en-zh",
+           "target_language": "zh",
+           "source_language": "en",
+           "lines": ["Hello world.", "The weather is nice today."]
+         }'
+# {"translations":["你好世界。","今天天气不错"],"engine":"local","target_language":"zh",...}
+```
+
+`context_lines: [{ text, trans }]` 可传入已译好的前几句作为上下文（LLM 引擎有效）。
+
 开了 `API_TOKEN` 后要带鉴权：
 
 ```bash
@@ -437,7 +614,46 @@ curl -s --noproxy '*' -G http://localhost:8787/api/upstream/models \
 | `WHISPER_COMMAND_TIMEOUT_MS` | `1800000` | CLI 超时（30 分钟） |
 | `MAX_UPLOAD_MB` | `200` | 单文件上限 |
 | `ALLOW_UPSTREAM_OVERRIDE` | `1` | 是否允许请求里带 `upstream_base_url` 切换上游；`0` 禁用 |
+| `TRANSLATION_ENGINE` | 空（auto） | 翻译引擎：`local` / `openai` |
+| `TRANSLATION_MODEL` | `Xenova/nllb-200-distilled-600M` | `local` 翻译引擎的 🤗 模型 |
+| `TRANSLATION_API_MODEL` | `gpt-4o-mini` | `openai` 翻译引擎的聊天模型 |
+| `TRANSLATION_TARGET` | `zh` | `/api/bilingual` 默认目标语言 |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | — | 出网代理，服务端已自动接管 |
+
+---
+
+## 命令行 CLI
+
+不想开页面、也不想手写 curl 时用 `scripts/cli.mjs`（`npm run cli`）：
+
+```bash
+npm run cli -- health                     # 探活
+npm run cli -- models                     # 服务端可用模型
+
+# 普通转写：直接要 SRT 并存盘
+npm run cli -- transcribe demo.mp3 --engine local --model tiny.en --format srt -o demo.srt
+
+# 双语：本地转写 + 本地翻译模型 → 双语 SRT
+npm run cli -- bilingual demo.mp3 --engine local --model tiny.en \
+            --translation-engine local --translation-model Xenova/opus-mt-en-zh \
+            --target zh --format srt -o demo.zh.srt
+
+# 双语：转写走本地，翻译交给 Groq 的 LLM（上下文语境翻译）
+npm run cli -- bilingual demo.mp3 --engine local --model tiny.en \
+            --translation-engine openai \
+            --upstream-base-url https://api.groq.com/openai/v1 \
+            --upstream-api-key gsk_xxx --translation-model llama-3.3-70b-versatile \
+            --target zh --format txt -o demo.zh.txt
+```
+
+- 所有 `--xxx` 都会原样转成同名的请求字段（`-` 变 `_`），
+  因此[转写参数表](#post-apitranscribe-参数)里的字段都能直接用。
+- 常用别名：`--target`（`target_language`）、`--source`（`source_language`）。
+- 不带 `--format` 返回完整 JSON 对象；带 `--format txt|srt|json` 返回导出内容。
+- 目标服务用 `WHISPER_API` 改（默认 `http://localhost:8787/api`），
+  鉴权用 `API_TOKEN`。
+
+> 别名命令：`npm run bilingual -- demo.mp3 --target zh ...`
 
 ---
 
@@ -448,27 +664,31 @@ whisper-web/
 ├── src/
 │   ├── App.tsx / index.tsx         # 入口
 │   ├── worker.js                   # 浏览器端 transformers.js worker（含进度上报）
+│   ├── translationWorker.js        # 浏览器端翻译 worker（Browser 翻译引擎）
 │   ├── components/
 │   │   ├── AudioManager.tsx        # 输入源、文件队列、Settings、批量导出
-│   │   ├── Transcript.tsx          # 结果展示 + 单文件导出按钮
-│   │   ├── TranscribeButton.tsx    # 转写按钮与进度
+│   │   ├── Transcript.tsx          # 双语结果 + 高亮跟随 + 点击跳转 + 导出按钮
+│   │   ├── TranscribeButton.tsx    # 转写 / 双语按钮与进度
 │   │   ├── Progress.tsx            # 进度条
 │   │   ├── AudioPlayer.tsx / AudioRecorder.tsx
 │   │   └── modal/                  # Modal / UrlInput（FileTile 在 AudioManager 内）
 │   ├── hooks/
-│   │   ├── useTranscriber.ts       # 三引擎调度、设置持久化
+│   │   ├── useTranscriber.ts       # 三引擎调度、翻译流程、设置持久化
 │   │   └── useWorker.ts
 │   ├── assets/ css/ vite-env.d.ts
 │   └── utils/
-│       ├── ExportFormats.js        # ★ 前后端共用的 txt/srt/json 生成
+│       ├── ExportFormats.js        # ★ 前后端共用的 txt/srt/json（含双语）
 │       ├── ExportUtils.ts          # 浏览器端下载封装
+│       ├── TranslationFormats.js   # ★ 前后端共用的语言表/提示词/解析
+│       ├── TranslationClient.ts    # 前端翻译客户端（浏览器 worker + 服务端）
 │       ├── ApiClient.ts            # 前端 API 客户端（health/models/transcribe）
 │       ├── AudioUtils.ts / BlobFix.ts / Constants.ts
 ├── server/
-│   ├── index.js                    # Express API（三引擎 + 返回格式）
+│   ├── index.js                    # Express API（三引擎 + 翻译 + 双语 + 返回格式）
 │   └── .env.example
 ├── scripts/
-│   ├── fetch-local-model.mjs       # npm run fetch-model（镜像优先下载权重）
+│   ├── fetch-local-model.mjs       # npm run fetch-model（任意仓库 + 镜像优先）
+│   ├── cli.mjs                     # npm run cli（transcribe / bilingual / models）
 │   └── dev-all.js                  # npm run dev:all
 ├── .cache/                         # 权重缓存（gitignored，可能上 GB）
 └── vite.config.ts                  # /api 代理（server.proxy + preview.proxy）
@@ -483,7 +703,8 @@ whisper-web/
 | `npm run dev` | 只起前端（5173） |
 | `npm run server` | 只起 API（8787） |
 | `npm run dev:all` | 两个一起起 |
-| `npm run fetch-model` | 下载权重到 `.cache/` |
+| `npm run fetch-model` | 下载权重到 `.cache/`（支持任意仓库） |
+| `npm run cli -- <cmd>` | 命令行转写 / 双语 / 查模型 |
 | `npm run build` | `tsc && vite build` |
 | `npm run preview` | 预览构建产物（已配置 `/api` 代理） |
 | `npm run tsc` | 类型检查 |
@@ -583,6 +804,23 @@ Git Bash 里 `pkill -f` 会匹配到**当前这条命令行本身**（因为里�
 
 `local` 引擎靠 ffmpeg 把任意音频转成 16kHz 单声道 f32le 再喂给模型，
 缺了它 mp3/m4a/flac 全会失败。
+
+**C5. 非 Xenova 的仓库下载失败**
+
+老版本只认 `onnx/encoder_model_quantized.onnx` + `onnx/decoder_model_merged_quantized.onnx`，
+所以 `zem214/whisper-medium` 这类命名不同的仓库必然失败。现在会先列仓库文件再挑，
+并按 transformers.js 的布局归一化。仍失败时按提示处理：
+镜像上没这个仓库（换 `--mirror`）、只有未合并的 decoder、或根本没有 ONNX 权重。
+先跑 `npm run fetch-model -- <id> --list` 看仓库里到底有什么。
+
+**C6. 翻译模型跑不起来**
+
+- `local` 翻译引擎报「权重不在缓存目录」：
+  `npm run fetch-model -- Xenova/opus-mt-en-zh`（脚本会按通用 ONNX 布局保存）。
+- NLLB / m2m100 / mBART 才需要 `src_lang` / `tgt_lang`，opus-mt 这类单语对模型
+  不需要；代码已按模型名自动判断。
+- Server API 翻译返回 404：说明那个端点的 `/chat/completions` 不存在
+  （只有 `/audio/transcriptions` 的 ASR 端点不能用来翻译）。
 
 ### D. 浏览器与前端
 

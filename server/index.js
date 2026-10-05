@@ -6,19 +6,28 @@
  *   GET  /api/models       -> available models
  *   POST /api/transcribe   -> multipart upload ("file"), returns
  *                             { text, chunks: [{ timestamp, text, trans }] }
+ *   POST /api/bilingual    -> same, but every chunk is also translated
+ *   POST /api/translate    -> JSON { lines, target_language }, returns
+ *                             { translations: [...] }
  *   POST /v1/audio/transcriptions  -> OpenAI compatible alias
  *
- * Three engines (WHISPER_ENGINE):
+ * Transcription engines (WHISPER_ENGINE):
  *   - "local"    : runs 🤗 Transformers.js in-process (works offline after the
  *                  first download, model ids like `Xenova/whisper-tiny.en`)
  *   - "openai"   : forwards to any OpenAI compatible endpoint
  *   - "command"  : runs a local CLI (openai-whisper / whisper.cpp / ...)
+ *
+ * Translation engines (TRANSLATION_ENGINE):
+ *   - "local"    : 🤗 Transformers.js `translation` pipeline
+ *                  (`Xenova/nllb-200-distilled-600M`, `Xenova/opus-mt-en-zh`, …)
+ *   - "openai"   : OpenAI compatible `/chat/completions` — LLM, context aware
  *
  * When WHISPER_ENGINE is not set the engine is auto-selected from the model id.
  *
  * Configuration (see .env.example):
  *   PORT, API_TOKEN, WHISPER_ENGINE, OPENAI_BASE_URL, OPENAI_API_KEY,
  *   OPENAI_MODEL, WHISPER_COMMAND, WHISPER_COMMAND_ARGS, WHISPER_COMMAND_MODEL,
+ *   TRANSLATION_ENGINE, TRANSLATION_MODEL, TRANSLATION_API_MODEL,
  *   LOCAL_CACHE_DIR, HTTP_PROXY / HTTPS_PROXY / NO_PROXY
  */
 
@@ -33,6 +42,15 @@ import cors from "cors";
 // Shared with the browser app so `response_format=txt|srt|json` returns
 // exactly what the "Export TXT / SRT / JSON" buttons produce.
 import { exportContent } from "../src/utils/ExportFormats.js";
+import {
+    TRANSLATION_BATCH_SIZE,
+    TRANSLATION_CONTEXT_SIZE,
+    buildTranslationPrompt,
+    languageLabel,
+    needsLanguageCodes,
+    nllbCode,
+    parseNumberedTranslations,
+} from "../src/utils/TranslationFormats.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -73,6 +91,18 @@ const HF_ENDPOINT = (process.env.HF_ENDPOINT || "https://huggingface.co/").repla
 ) + "/";
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 200);
 
+// ---------------------------------------------------------------------------
+// Translation
+// ---------------------------------------------------------------------------
+const TRANSLATION_ENGINE = (process.env.TRANSLATION_ENGINE || "").toLowerCase();
+/** 🤗 model used by the `local` translation engine. */
+const TRANSLATION_MODEL =
+    process.env.TRANSLATION_MODEL || "Xenova/nllb-200-distilled-600M";
+/** Chat model used by the `openai` translation engine. */
+const TRANSLATION_API_MODEL =
+    process.env.TRANSLATION_API_MODEL || "gpt-4o-mini";
+const TRANSLATION_DEFAULT_TARGET = process.env.TRANSLATION_TARGET || "zh";
+
 // Node's global `fetch` ignores HTTP_PROXY/HTTPS_PROXY, so we install an
 // environment aware dispatcher when a proxy is configured.
 const PROXY_URL =
@@ -99,6 +129,8 @@ const upload = multer({
 
 const app = express();
 app.use(cors());
+// /api/translate and /api/bilingual take JSON bodies
+app.use(express.json({ limit: "16mb" }));
 
 /** Optional shared secret: send `Authorization: Bearer <API_TOKEN>` or `X-API-Key`. */
 function requireToken(req, res, next) {
@@ -168,6 +200,22 @@ function dirSize(dir) {
     };
     walk(dir);
     return total;
+}
+
+/** Which task a cached model can do, read from its config.json. */
+function modelTask(model) {
+    try {
+        const config = JSON.parse(
+            fs.readFileSync(localModelPath(model, "config.json"), "utf8"),
+        );
+        const type = String(config?.model_type ?? "").toLowerCase();
+        // `marian` = opus-mt, `m2m_100` = nllb / m2m100, `mbart` = mBART
+        if (/whisper/.test(type)) return "asr";
+        if (/marian|m2m|mbart|bart|t5|nllb/.test(type)) return "translation";
+    } catch (e) {
+        // unreadable config -> unknown
+    }
+    return "";
 }
 
 /** Every model id that has usable weights in LOCAL_CACHE_DIR. */
@@ -492,14 +540,230 @@ function runCommand({ file, model, language, task }) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Engine: translation
+ *   "local"  -> 🤗 Transformers.js `translation` pipeline
+ *   "openai" -> OpenAI compatible /chat/completions (context aware LLM)
+ * ------------------------------------------------------------------ */
+
+const translationPipelines = new Map();
+
+/** Does the cache hold usable weights for a generic (non whisper) model? */
+function inspectGenericModel(model) {
+    const quantized = fs.existsSync(
+        localModelPath(model, "onnx/model_quantized.onnx"),
+    );
+    const specific = fs.existsSync(
+        localModelPath(model, "onnx/encoder_model_quantized.onnx"),
+    );
+    const specificFp32 = fs.existsSync(
+        localModelPath(model, "onnx/encoder_model.onnx"),
+    );
+    const fp32 =
+        fs.existsSync(localModelPath(model, "onnx/model.onnx")) ||
+        specificFp32;
+    return { exists: quantized || specific || fp32, quantized: quantized || specific, fp32 };
+}
+
+async function runLocalTranslation({
+    lines,
+    model,
+    sourceLanguage,
+    targetLanguage,
+    quantized,
+}) {
+    const { pipeline, env } = await import("@xenova/transformers");
+    env.allowLocalModels = true;
+    env.useFSCache = true;
+    env.cacheDir = LOCAL_CACHE_DIR;
+    env.remoteHost = HF_ENDPOINT;
+
+    const weights = inspectGenericModel(model);
+    const offline =
+        LOCAL_OFFLINE === "1" ||
+        LOCAL_OFFLINE === "true" ||
+        (LOCAL_OFFLINE === "auto" && weights.exists);
+    env.allowRemoteModels = !offline;
+
+    if (!weights.exists && offline) {
+        throw new Error(
+            `本地翻译模型 ${model} 的权重不在缓存目录里。` +
+                `请先执行：npm run fetch-model -- ${model}（缓存目录 ${LOCAL_CACHE_DIR}）`,
+        );
+    }
+    if (weights.exists && !weights.quantized) quantized = false;
+
+    const key = `${model}|${quantized}`;
+    let pending = translationPipelines.get(key);
+    if (!pending) {
+        console.log(`[translate] loading pipeline ${model}`);
+        pending = pipeline("translation", model, { quantized });
+        translationPipelines.set(key, pending);
+        pending.catch(() => translationPipelines.delete(key));
+    }
+    const translator = await pending;
+
+    const options = {};
+    if (needsLanguageCodes(model)) {
+        options.src_lang = nllbCode(sourceLanguage) || "eng_Latn";
+        options.tgt_lang = nllbCode(targetLanguage) || nllbCode("zh") || "zho_Hans";
+    }
+
+    const output = await translator(
+        lines.map((line) => String(line ?? "").trim()),
+        options,
+    );
+    return (Array.isArray(output) ? output : [output]).map(
+        (item) => item?.translation_text ?? "",
+    );
+}
+
+/** Call an OpenAI compatible chat endpoint and parse the numbered reply. */
+async function translateViaChat({
+    lines,
+    model,
+    sourceLanguage,
+    targetLanguage,
+    context,
+    apiKey,
+    baseUrl,
+}) {
+    const prompt = buildTranslationPrompt({
+        lines,
+        context: context ?? [],
+        sourceLanguage,
+        targetLanguage,
+    });
+
+    const base = upstreamRoot(baseUrl || OPENAI_BASE_URL);
+    const url = `${base}/chat/completions`;
+    const body = {
+        model: model || TRANSLATION_API_MODEL,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.2,
+    };
+
+    let response;
+    try {
+        response = await fetch(url, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+            },
+            body: JSON.stringify(body),
+        });
+    } catch (error) {
+        const cause = error?.cause?.message ? ` (${error.cause.message})` : "";
+        throw new Error(
+            `无法访问上游 ${url}: ${error?.message ?? error}${cause}. ` +
+                `若在代理环境下请设置 HTTPS_PROXY/HTTP_PROXY；或改用 ` +
+                `"translation_engine": "local"（先 npm run fetch-model -- ${TRANSLATION_MODEL}）。`,
+        );
+    }
+
+    const text = await response.text();
+    if (!response.ok) {
+        throw new Error(`上游 ${response.status} ${response.statusText}: ${text.slice(0, 600)}`);
+    }
+    let content = "";
+    try {
+        const json = JSON.parse(text);
+        content = json?.choices?.[0]?.message?.content ?? "";
+    } catch (e) {
+        content = text;
+    }
+    if (!content) {
+        throw new Error(`上游未返回译文：${text.slice(0, 300)}`);
+    }
+    return parseNumberedTranslations(content, lines.length);
+}
+
+/**
+ * Translate every line, batched, carrying the previous lines over as context
+ * for the LLM engines. Returns an array with the same length as `lines`.
+ */
+async function translateLines({
+    lines,
+    engine,
+    model,
+    sourceLanguage,
+    targetLanguage,
+    contextLines,
+    upstreamBase,
+    upstreamKey,
+    upstreamModel,
+}) {
+    const list = (lines ?? []).map((line) => String(line ?? ""));
+    const size = Math.max(1, TRANSLATION_BATCH_SIZE);
+    const result = new Array(list.length).fill("");
+
+    for (let start = 0; start < list.length; start += size) {
+        const batch = list.slice(start, start + size);
+        const context = [];
+        for (
+            let i = Math.max(0, start - TRANSLATION_CONTEXT_SIZE);
+            i < start;
+            i++
+        ) {
+            context.push({ text: list[i], trans: result[i] });
+        }
+        // The very first batch can use context supplied by the caller.
+        const merged =
+            start === 0 && Array.isArray(contextLines) && contextLines.length
+                ? contextLines
+                : context;
+
+        let translated;
+        if (engine === "local") {
+            translated = await runLocalTranslation({
+                lines: batch,
+                model: model || TRANSLATION_MODEL,
+                sourceLanguage,
+                targetLanguage,
+                quantized: true,
+            });
+        } else {
+            translated = await translateViaChat({
+                lines: batch,
+                model: upstreamModel || model || TRANSLATION_API_MODEL,
+                sourceLanguage,
+                targetLanguage,
+                context: merged,
+                apiKey: upstreamKey || OPENAI_API_KEY || "",
+                baseUrl: upstreamBase || OPENAI_BASE_URL,
+            });
+        }
+        for (let i = 0; i < batch.length; i++) {
+            result[start + i] = translated[i] ?? "";
+        }
+    }
+    return result;
+}
+
+/** Which translation engine should handle this request? */
+function resolveTranslationEngine(explicit, upstreamBase) {
+    if (explicit === "local" || explicit === "openai") return explicit;
+    if (upstreamBase) return "openai";
+    if (TRANSLATION_ENGINE === "local" || TRANSLATION_ENGINE === "openai") {
+        return TRANSLATION_ENGINE;
+    }
+    // An OpenAI key alone is not enough for translation (it needs a chat
+    // model); fall back to the local model.
+    return "local";
+}
+
+/* ------------------------------------------------------------------ *
  * Routes
  * ------------------------------------------------------------------ */
 
-function transcribeHandler(req, res) {
-    if (!req.file) {
-        return res.status(400).json({ error: "Missing 'file' field" });
-    }
-
+/**
+ * Run the transcription for an already uploaded file.
+ *
+ * Rejects with a plain `Error` for runtime problems; request level problems
+ * (missing key, disabled upstream override) are signalled through
+ * `error.status` so the handler can reply with the right HTTP code.
+ */
+async function runTranscription(req) {
     const requestedModel = req.body?.model || defaultModel();
     const language = req.body?.language || "";
     const task = req.body?.task === "translate" ? "translate" : "transcribe";
@@ -532,9 +796,11 @@ function transcribeHandler(req, res) {
 
     const useUpstream = Boolean(upstreamBase) && ALLOW_UPSTREAM_OVERRIDE;
     if (upstreamBase && !ALLOW_UPSTREAM_OVERRIDE) {
-        return res.status(403).json({
-            error: "服务端已禁用按请求覆盖上游（ALLOW_UPSTREAM_OVERRIDE=0）",
-        });
+        const error = new Error(
+            "服务端已禁用按请求覆盖上游（ALLOW_UPSTREAM_OVERRIDE=0）",
+        );
+        error.status = 403;
+        throw error;
     }
 
     const effectiveBase = useUpstream ? upstreamBase : OPENAI_BASE_URL;
@@ -546,22 +812,29 @@ function transcribeHandler(req, res) {
         : model;
 
     if (engine === "openai" && !apiKey && !useUpstream) {
-        return res.status(400).json({
-            error:
-                "openai 引擎未配置：请设置 OPENAI_API_KEY（或 OPENAI_BASE_URL），" +
+        const error = new Error(
+            "openai 引擎未配置：请设置 OPENAI_API_KEY（或 OPENAI_BASE_URL），" +
                 "或在请求里带上 upstream_base_url / upstream_api_key。" +
                 "本机没有外网到 api.openai.com，建议改用 -F engine=local " +
                 "（先 npm run fetch-model）或 -F engine=command。",
-        });
+        );
+        error.status = 400;
+        throw error;
     }
 
-    let job;
+    let raw;
     if (engine === "local") {
-        job = runLocal({ file: req.file, model, language, task, quantized });
+        raw = await runLocal({
+            file: req.file,
+            model,
+            language,
+            task,
+            quantized,
+        });
     } else if (engine === "command") {
-        job = runCommand({ file: req.file, model, language, task });
+        raw = await runCommand({ file: req.file, model, language, task });
     } else {
-        job = forwardToOpenAI({
+        raw = await forwardToOpenAI({
             file: req.file,
             model: effectiveModel,
             language,
@@ -571,49 +844,214 @@ function transcribeHandler(req, res) {
         });
     }
 
-    job.then((raw) => {
-        const result = normalize(raw, effectiveModel || model, engine);
+    return normalize(raw, effectiveModel || model, engine);
+}
 
-        // `response_format` (or `format`) lets callers receive the exact
-        // payload the UI exports: txt / srt / json.
-        const requestedFormat = String(
-            req.body?.response_format ??
-                req.body?.format ??
-                req.query?.response_format ??
-                req.query?.format ??
-                "",
-        ).toLowerCase();
-
-        if (!requestedFormat) {
-            return res.json(result);
-        }
-        if (!["txt", "srt", "json"].includes(requestedFormat)) {
-            // unknown values (verbose_json, text, ...) keep the rich object
-            return res.json(result);
-        }
-
-        const { body, mime, ext } = exportContent(
-            result.chunks ?? [],
-            requestedFormat,
-        );
-        const base = (req.file.originalname || "transcript").replace(
-            /\.[^.]+$/,
+/**
+ * Send a transcription result, honouring `response_format`
+ * (txt / srt / json — identical to the UI's export buttons).
+ */
+function sendTranscription(req, res, result, options = {}) {
+    // `response_format` (or `format`) lets callers receive the exact
+    // payload the UI exports: txt / srt / json.
+    const requestedFormat = String(
+        req.body?.response_format ??
+            req.body?.format ??
+            req.query?.response_format ??
+            req.query?.format ??
             "",
-        );
-        const disposition =
-            req.query?.download === "1" || req.query?.download === "true"
-                ? "attachment"
-                : "inline";
-        res.setHeader("Content-Type", mime);
-        res.setHeader(
-            "Content-Disposition",
-            `${disposition}; filename="${base}.${ext}"`,
-        );
-        res.send(body);
-    }).catch((error) => {
-        console.error("[transcribe] failed:", error);
-        res.status(500).json({ error: error?.message ?? String(error) });
+    ).toLowerCase();
+
+    if (!requestedFormat) {
+        return res.json(result);
+    }
+    if (!["txt", "srt", "json"].includes(requestedFormat)) {
+        // unknown values (verbose_json, text, ...) keep the rich object
+        return res.json(result);
+    }
+
+    const explicitBilingual = String(
+        req.body?.bilingual ?? req.query?.bilingual ?? "",
+    ).toLowerCase();
+    const hasTranslations = (result.chunks ?? []).some(
+        (chunk) => String(chunk?.trans ?? "").trim().length > 0,
+    );
+    const bilingual =
+        options.bilingual ??
+        (explicitBilingual === "1" ||
+            explicitBilingual === "true" ||
+            hasTranslations);
+
+    const { body, mime, ext } = exportContent(result.chunks ?? [], requestedFormat, {
+        bilingual,
     });
+    const base = (req.file?.originalname || "transcript").replace(
+        /\.[^.]+$/,
+        "",
+    );
+    const disposition =
+        req.query?.download === "1" || req.query?.download === "true"
+            ? "attachment"
+            : "inline";
+    const suffix = bilingual && ext !== "json" ? ".bilingual" : "";
+    res.setHeader("Content-Type", mime);
+    res.setHeader(
+        "Content-Disposition",
+        `${disposition}; filename="${base}${suffix}.${ext}"`,
+    );
+    res.send(body);
+}
+
+function handleError(res, label, error) {
+    console.error(`[${label}] failed:`, error);
+    res.status(error?.status ?? 500).json({
+        error: error?.message ?? String(error),
+    });
+}
+
+function transcribeHandler(req, res) {
+    if (!req.file) {
+        return res.status(400).json({ error: "Missing 'file' field" });
+    }
+    runTranscription(req)
+        .then((result) => sendTranscription(req, res, result))
+        .catch((error) => handleError(res, "transcribe", error));
+}
+
+/**
+ * Transcribe **and** translate: every chunk gets a `trans` field, so the UI
+ * shows bilingual subtitles and the txt/srt exports contain both languages.
+ */
+async function bilingualHandler(req, res) {
+    if (!req.file) {
+        return res.status(400).json({ error: "Missing 'file' field" });
+    }
+    try {
+        const result = await runTranscription(req);
+
+        const targetLanguage = String(
+            req.body?.target_language ??
+                req.body?.targetLanguage ??
+                req.query?.target_language ??
+                TRANSLATION_DEFAULT_TARGET,
+        );
+        const sourceLanguage = String(
+            req.body?.source_language ??
+                req.body?.sourceLanguage ??
+                result?.language ??
+                "",
+        );
+        const translationEngine = resolveTranslationEngine(
+            String(
+                req.body?.translation_engine ??
+                    req.body?.translationEngine ??
+                    req.query?.translation_engine ??
+                    "",
+            ).toLowerCase(),
+            String(req.body?.upstream_base_url || "").trim(),
+        );
+        const translationModel = String(
+            req.body?.translation_model ??
+                req.body?.translationModel ??
+                (translationEngine === "local"
+                    ? TRANSLATION_MODEL
+                    : TRANSLATION_API_MODEL),
+        );
+
+        const lines = (result.chunks ?? []).map((chunk) => chunk.text ?? "");
+        const translations = lines.length
+            ? await translateLines({
+                  lines,
+                  engine: translationEngine,
+                  model: translationModel,
+                  sourceLanguage,
+                  targetLanguage,
+                  upstreamBase: String(
+                      req.body?.upstream_base_url || "",
+                  ).trim(),
+                  upstreamKey: String(req.body?.upstream_api_key || "").trim(),
+                  // The chat model differs from the whisper model.
+                  upstreamModel: String(
+                      req.body?.translation_model ??
+                          req.body?.translationModel ??
+                          "",
+                  ).trim(),
+              })
+            : [];
+
+        result.chunks = (result.chunks ?? []).map((chunk, i) => ({
+            ...chunk,
+            trans: translations[i] ?? "",
+        }));
+        result.translation = {
+            engine: translationEngine,
+            model: translationModel,
+            target_language: targetLanguage,
+            label: languageLabel(targetLanguage),
+        };
+
+        sendTranscription(req, res, result, { bilingual: true });
+    } catch (error) {
+        handleError(res, "bilingual", error);
+    }
+}
+
+/**
+ * Translate a list of lines.
+ *   POST /api/translate  { lines: [...], target_language: "zh", engine: "local" }
+ */
+async function translateHandler(req, res) {
+    try {
+        const lines = Array.isArray(req.body?.lines)
+            ? req.body.lines.map((line) => String(line ?? ""))
+            : [];
+        if (!lines.length) {
+            return res.json({
+                translations: [],
+                engine: null,
+                target_language: null,
+            });
+        }
+
+        const targetLanguage = String(
+            req.body?.target_language ??
+                req.body?.targetLanguage ??
+                TRANSLATION_DEFAULT_TARGET,
+        );
+        const sourceLanguage = String(
+            req.body?.source_language ?? req.body?.sourceLanguage ?? "",
+        );
+        const upstreamBase = String(
+            req.body?.upstream_base_url || "",
+        ).trim();
+        const engine = resolveTranslationEngine(
+            String(req.body?.engine ?? "").toLowerCase(),
+            upstreamBase,
+        );
+
+        const translations = await translateLines({
+            lines,
+            engine,
+            model: String(req.body?.model || ""),
+            sourceLanguage,
+            targetLanguage,
+            contextLines: Array.isArray(req.body?.context_lines)
+                ? req.body.context_lines
+                : [],
+            upstreamBase,
+            upstreamKey: String(req.body?.upstream_api_key || "").trim(),
+            upstreamModel: String(req.body?.upstream_model || "").trim(),
+        });
+
+        res.json({
+            translations,
+            engine,
+            target_language: targetLanguage,
+            source_language: sourceLanguage || null,
+        });
+    } catch (error) {
+        handleError(res, "translate", error);
+    }
 }
 
 /**
@@ -743,6 +1181,14 @@ app.get("/api/health", (req, res) => {
         localModels: cached,
         localCacheDir: LOCAL_CACHE_DIR,
         localReady: cached.length > 0,
+        translation: {
+            engines: ["local", "openai"],
+            engine: TRANSLATION_ENGINE || "auto",
+            model: TRANSLATION_MODEL,
+            apiModel: TRANSLATION_API_MODEL,
+            defaultTarget: TRANSLATION_DEFAULT_TARGET,
+            localReady: inspectGenericModel(TRANSLATION_MODEL).exists,
+        },
         proxy: PROXY_URL || null,
         authRequired: Boolean(API_TOKEN),
         upstreamOverride: ALLOW_UPSTREAM_OVERRIDE,
@@ -764,6 +1210,11 @@ app.get("/api/models", requireToken, (req, res) => {
             quantized: info.quantized,
             fp32: info.fp32,
             size: dirSize(path.join(LOCAL_CACHE_DIR, id)),
+            // "asr" (whisper family) / "translation" (opus-mt, nllb, ...) /
+            // "" when the config cannot be read. Translation models also ship
+            // an `encoder_model*.onnx`, so the UI needs this to tell them
+            // apart in the model dropdown.
+            task: modelTask(id),
         };
     });
 
@@ -810,6 +1261,19 @@ app.post(
     upload.single("file"),
     transcribeHandler,
 );
+app.post(
+    "/api/bilingual",
+    requireToken,
+    upload.single("file"),
+    bilingualHandler,
+);
+app.post(
+    "/v1/audio/bilingual",
+    requireToken,
+    upload.single("file"),
+    bilingualHandler,
+);
+app.post("/api/translate", requireToken, translateHandler);
 app.post(
     "/v1/audio/transcriptions",
     requireToken,

@@ -11,6 +11,12 @@ import AudioRecorder from "./AudioRecorder";
 import { formatAudioTimestamp } from "../utils/AudioUtils";
 import { exportAll } from "../utils/ExportUtils";
 import {
+    TRANSLATION_API_MODELS,
+    TRANSLATION_LANGUAGES,
+    TRANSLATION_MODELS,
+    TranslationEngine,
+} from "../utils/TranslationClient";
+import {
     checkApiHealth,
     fetchApiModels,
     classifyApiBase,
@@ -180,6 +186,9 @@ function nameFromUrl(url: string) {
 export function AudioManager(props: {
     transcriber: Transcriber;
     onSelectedFileChange?: (name: string | undefined) => void;
+    /** Shared audio element so the subtitle list can follow playback. */
+    audioRef?: React.MutableRefObject<HTMLAudioElement | null>;
+    onTimeUpdate?: (time: number) => void;
 }) {
     const [progress, setProgress] = useState<number | undefined>(undefined);
     const [items, setItems] = useState<AudioItem[]>([]);
@@ -196,6 +205,8 @@ export function AudioManager(props: {
     const batchRef = useRef<{ running: boolean; index: number } | undefined>(
         undefined,
     );
+    /** Does the current run also translate (Bilingual subtitles)? */
+    const batchBilingualRef = useRef(false);
     const lastOutputRef = useRef<unknown>(undefined);
 
     useEffect(() => {
@@ -224,6 +235,7 @@ export function AudioManager(props: {
 
     const resetAudio = () => {
         batchRef.current = undefined;
+        batchBilingualRef.current = false;
         lastOutputRef.current = undefined;
         setBatch(undefined);
         setSelectedId(undefined);
@@ -253,6 +265,7 @@ export function AudioManager(props: {
 
     const addSingle = (item: AudioItem) => {
         batchRef.current = undefined;
+        batchBilingualRef.current = false;
         lastOutputRef.current = undefined;
         setBatch(undefined);
         updateItems(() => [item]);
@@ -263,14 +276,19 @@ export function AudioManager(props: {
 
     const startTranscribe = (item: AudioItem) => {
         lastOutputRef.current = undefined;
-        props.transcriber.start(item.buffer, item.file, item.name);
+        props.transcriber.start(item.buffer, item.file, item.name, {
+            bilingual: batchBilingualRef.current,
+        });
     };
 
     // Handle a finished transcription: store the result and (in batch mode)
-    // move on to the next file.
+    // move on to the next file. In bilingual mode we wait for the translation
+    // step to complete first.
     useEffect(() => {
         const output = props.transcriber.output;
         if (!output || output.isBusy || props.transcriber.isBusy) return;
+        // A bilingual run is only finished once `bilingual` is set.
+        if (batchBilingualRef.current && !output.bilingual) return;
         if (lastOutputRef.current === output) return;
         lastOutputRef.current = output;
 
@@ -378,6 +396,7 @@ export function AudioManager(props: {
         }
 
         batchRef.current = undefined;
+        batchBilingualRef.current = false;
         lastOutputRef.current = undefined;
         setBatch(undefined);
         props.transcriber.onInputChange();
@@ -477,9 +496,11 @@ export function AudioManager(props: {
         }
     }, [audioDownloadUrl]);
 
-    const onTranscribeClick = () => {
+    const runQueue = (bilingual: boolean) => {
         const list = items.filter((item) => item.status !== "error");
         if (list.length === 0) return;
+
+        batchBilingualRef.current = bilingual;
 
         if (list.length === 1) {
             startTranscribe(list[0]);
@@ -495,7 +516,16 @@ export function AudioManager(props: {
         startTranscribe(list[0]);
     };
 
+    const onTranscribeClick = () => runQueue(false);
+    const onBilingualClick = () => runQueue(true);
+
     const doneItems = items.filter((item) => item.result);
+    // Any stored result that carries a translation is exported bilingually.
+    const anyBilingual = doneItems.some((item) =>
+        (item.result?.chunks ?? []).some(
+            (chunk) => String(chunk.trans ?? "").trim().length > 0,
+        ),
+    );
 
     const exportAllAs = (format: "json" | "txt" | "srt") => {
         exportAll(
@@ -504,6 +534,7 @@ export function AudioManager(props: {
                 chunks: item.result?.chunks ?? [],
             })),
             format,
+            { bilingual: anyBilingual },
         );
     };
 
@@ -516,8 +547,18 @@ export function AudioManager(props: {
         ? uploadProgress
         : transcribeProgress?.value;
 
+    const translateProgress = props.transcriber.translationProgress;
+    const translationProgressValue =
+        translateProgress && translateProgress.total > 0
+            ? translateProgress.done / translateProgress.total
+            : undefined;
+
     let progressText = "";
-    if (props.transcriber.isModelLoading) {
+    if (props.transcriber.isTranslating) {
+        progressText = `Translating... ${translateProgress?.done ?? 0}/${
+            translateProgress?.total ?? "?"
+        }`;
+    } else if (props.transcriber.isModelLoading) {
         progressText = "Loading model files... (only run once)";
     } else if (usesServer) {
         progressText =
@@ -663,9 +704,11 @@ export function AudioManager(props: {
                     <AudioPlayer
                         audioUrl={audioData.url}
                         mimeType={audioData.mimeType}
+                        playerRef={props.audioRef}
+                        onTimeUpdate={props.onTimeUpdate}
                     />
 
-                    <div className='relative w-full flex justify-center items-center'>
+                    <div className='relative w-full flex flex-wrap justify-center items-center gap-y-2'>
                         <TranscribeButton
                             onClick={onTranscribeClick}
                             isModelLoading={props.transcriber.isModelLoading}
@@ -677,6 +720,24 @@ export function AudioManager(props: {
                                     ? `Transcribe All (${items.length})`
                                     : "Transcribe Audio"
                             }
+                        />
+
+                        <TranscribeButton
+                            onClick={onBilingualClick}
+                            isModelLoading={props.transcriber.isModelLoading}
+                            isTranscribing={props.transcriber.isBusy}
+                            progress={
+                                props.transcriber.isTranslating
+                                    ? translationProgressValue
+                                    : progressValue
+                            }
+                            idleText={
+                                items.length > 1
+                                    ? `Bilingual All (${items.length})`
+                                    : "Bilingual subtitles"
+                            }
+                            busyText='Translating...'
+                            className='text-white bg-indigo-600 hover:bg-indigo-700 focus:ring-4 focus:ring-indigo-300 font-medium rounded-lg text-sm px-5 py-2.5 text-center mr-2 dark:bg-indigo-500 dark:hover:bg-indigo-600 dark:focus:ring-indigo-800 inline-flex items-center'
                         />
 
                         <SettingsTile
@@ -696,7 +757,9 @@ export function AudioManager(props: {
                             )}
                             <ProgressBar
                                 progress={`${Math.round(
-                                    (progressValue ?? 0) * 100,
+                                    ((props.transcriber.isTranslating
+                                        ? translationProgressValue
+                                        : progressValue) ?? 0) * 100,
                                 )}%`}
                             />
                             <div className='text-xs text-slate-500 mt-1'>
@@ -770,9 +833,11 @@ function SettingsModal(props: {
     const [modelsStatus, setModelsStatus] = useState<string>("");
     const [loadingModels, setLoadingModels] = useState(false);
     const [customModel, setCustomModel] = useState(false);
+    const [customTranslationModel, setCustomTranslationModel] = useState(false);
 
     const names = Object.values(LANGUAGES).map(titleCase);
     const engine = props.transcriber.engine;
+    const translationEngine = props.transcriber.translationEngine;
     const isApi = engine === "api";
     // The "local" engine runs the model inside the Node server
     // (transformers.js) instead of inside the browser.
@@ -847,7 +912,10 @@ function SettingsModal(props: {
                   "medium.en",
                   "distil-large-v2",
               ];
-    const modelOptions: ApiModelOption[] =
+    // Translation models (opus-mt / nllb / ...) also ship an
+    // `encoder_model*.onnx`, so `/api/models` reports them too — never offer
+    // them as a transcription model.
+    const modelOptions: ApiModelOption[] = (
         serverModels.length > 0
             ? serverModels
             : fallbackIds.map((id) => ({
@@ -855,7 +923,9 @@ function SettingsModal(props: {
                   note: "内置别名",
                   cached: false,
                   kind: "alias" as const,
-              }));
+                  task: "",
+              }))
+    ).filter((option: ApiModelOption) => option.task !== "translation");
     const currentInList = modelOptions.some((o) => o.id === currentModel);
 
     const models = {
@@ -883,6 +953,50 @@ function SettingsModal(props: {
 
     const inputClass =
         "mt-1 mb-2 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white";
+    const selectClass =
+        "mt-1 mb-2 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:text-white";
+
+    // Which translation model setting applies to the selected engine.
+    const currentTranslationModel =
+        translationEngine === "api"
+            ? props.transcriber.translationApiModel
+            : props.transcriber.translationModel;
+    const setCurrentTranslationModelValue =
+        translationEngine === "api"
+            ? props.transcriber.setTranslationApiModel
+            : props.transcriber.setTranslationModel;
+    // Cached translation models reported by the server come first.
+    const cachedTranslationModels = serverModels
+        .filter((option) => option.task === "translation")
+        .map((option) => ({
+            id: option.id,
+            note: "已缓存（服务端）",
+            multilingual: true,
+            size: "",
+        }));
+    const translationModelOptions =
+        translationEngine === "api"
+            ? TRANSLATION_API_MODELS.map((id) => ({
+                  id,
+                  note: "聊天模型",
+                  multilingual: true,
+                  size: "",
+              }))
+            : [
+                  ...cachedTranslationModels,
+                  ...TRANSLATION_MODELS.filter(
+                      (option) =>
+                          !cachedTranslationModels.some(
+                              (cached) => cached.id === option.id,
+                          ),
+                  ),
+              ];
+    const translationModelList = translationModelOptions.map(
+        (option) => option.id,
+    );
+    const translationModelInList = translationModelList.includes(
+        currentTranslationModel,
+    );
 
     return (
         <Modal
@@ -1178,6 +1292,122 @@ function SettingsModal(props: {
                             </select>
                         </>
                     )}
+
+                    <hr className='my-3 border-slate-200' />
+
+                    <label>Translation engine</label>
+                    <select
+                        className={selectClass}
+                        value={props.transcriber.translationEngine}
+                        onChange={(e) =>
+                            props.transcriber.setTranslationEngine(
+                                e.target.value as TranslationEngine,
+                            )
+                        }
+                    >
+                        <option value={"browser"}>
+                            Browser (in-browser model)
+                        </option>
+                        <option value={"local"}>
+                            本地引擎 Local engine (server)
+                        </option>
+                        <option value={"api"}>Server API</option>
+                    </select>
+                    <p className='text-xs text-slate-500 mb-2'>
+                        {translationEngine === "browser"
+                            ? "浏览器内用 🤗 Transformers.js 翻译模型（首次会下载模型）。"
+                            : translationEngine === "local"
+                            ? "由 Node 服务用 🤗 Transformers.js 翻译（权重在服务端 .cache）。"
+                            : "调用 OpenAI 兼容的 /chat/completions（LLM，上下文语境翻译效果最好）。"}
+                    </p>
+
+                    <label>Translate subtitles into</label>
+                    <select
+                        className={selectClass}
+                        value={props.transcriber.translationTarget}
+                        onChange={(e) =>
+                            props.transcriber.setTranslationTarget(
+                                e.target.value,
+                            )
+                        }
+                    >
+                        {!TRANSLATION_LANGUAGES.some(
+                            (l) => l.id === props.transcriber.translationTarget,
+                        ) && (
+                            <option value={props.transcriber.translationTarget}>
+                                {props.transcriber.translationTarget ||
+                                    "(未选择)"}
+                            </option>
+                        )}
+                        {TRANSLATION_LANGUAGES.map((language) => (
+                            <option key={language.id} value={language.id}>
+                                {language.label}
+                            </option>
+                        ))}
+                    </select>
+
+                    <div className='flex items-center justify-between'>
+                        <label>
+                            Translation model
+                            <span className='text-xs text-slate-400'>
+                                {translationEngine === "api"
+                                    ? "（聊天模型）"
+                                    : "（🤗 翻译模型）"}
+                            </span>
+                        </label>
+                        <button
+                            type='button'
+                            onClick={() => setCustomTranslationModel((v) => !v)}
+                            className='text-slate-500 hover:text-indigo-600 text-xs'
+                        >
+                            {customTranslationModel ? "从列表选择" : "手动输入"}
+                        </button>
+                    </div>
+                    {customTranslationModel ? (
+                        <input
+                            className={inputClass}
+                            value={currentTranslationModel}
+                            onChange={(e) =>
+                                setCurrentTranslationModelValue(e.target.value)
+                            }
+                        />
+                    ) : (
+                        <select
+                            className={selectClass}
+                            value={currentTranslationModel}
+                            onChange={(e) =>
+                                setCurrentTranslationModelValue(e.target.value)
+                            }
+                        >
+                            {!translationModelInList && (
+                                <option value={currentTranslationModel}>
+                                    {currentTranslationModel || "(未选择)"}
+                                    {" — 当前值（不在列表中）"}
+                                </option>
+                            )}
+                            {translationModelOptions.map((option) => (
+                                <option key={option.id} value={option.id}>
+                                    {option.id}
+                                    {option.size
+                                        ? ` — ${option.size}`
+                                        : ""} · {option.note}
+                                </option>
+                            ))}
+                        </select>
+                    )}
+                    {translationEngine === "local" && (
+                        <p className='text-xs text-slate-400 mb-2'>
+                            服务端模型需先下载：npm run fetch-model --{" "}
+                            {currentTranslationModel ||
+                                "Xenova/nllb-200-distilled-600M"}
+                        </p>
+                    )}
+                    {translationEngine === "api" && (
+                        <p className='text-xs text-slate-400 mb-2'>
+                            Server API 翻译复用上方 Server API 的 Base URL 与
+                            API Key，请求经本地服务端中转。
+                        </p>
+                    )}
                 </>
             }
             onClose={props.onClose}
@@ -1285,10 +1515,15 @@ function FileTile(props: {
             const files = Array.from(elem.files ?? []);
             elem.value = "";
             setShowModal(false);
+            elem.remove();
             if (files.length > 0) {
                 props.onFilesUpdate(files);
             }
         };
+        // Keep it in the DOM (hidden) — detached inputs cannot be targeted by
+        // automation tools, and some browsers ignore click() on them.
+        elem.style.display = "none";
+        document.body.appendChild(elem);
         elem.click();
     };
 

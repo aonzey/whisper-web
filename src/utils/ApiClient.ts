@@ -219,6 +219,8 @@ export interface ApiModelOption {
     cached: boolean;
     /** Local (transformers.js) model vs. plain alias / remote model. */
     kind: "local" | "alias" | "remote";
+    /** What the model can do: "asr" (whisper) / "translation" / "" unknown. */
+    task?: string;
 }
 
 function humanSize(bytes?: number) {
@@ -286,6 +288,7 @@ export async function fetchApiModels(
                 note: `已缓存 · ${precision}${size ? ` · ${size}` : ""}`,
                 cached: Boolean(item.cached),
                 kind: "local",
+                task: item.task ?? "",
             });
         }
 

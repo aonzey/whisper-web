@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { AudioManager } from "./components/AudioManager";
 import Transcript from "./components/Transcript";
 import { useTranscriber } from "./hooks/useTranscriber";
@@ -6,6 +6,19 @@ import { useTranscriber } from "./hooks/useTranscriber";
 function App() {
     const transcriber = useTranscriber();
     const [fileName, setFileName] = useState<string | undefined>(undefined);
+
+    // Shared with Transcript so the subtitle list can follow (and control)
+    // the player.
+    const audioRef = useRef<HTMLAudioElement | null>(null);
+    const [currentTime, setCurrentTime] = useState(0);
+
+    const seekTo = useCallback((time: number) => {
+        const element = audioRef.current;
+        if (!element) return;
+        element.currentTime = time;
+        // Autoplay may be blocked until the user interacts; ignore failures.
+        void element.play().catch(() => {});
+    }, []);
 
     return (
         <div className='flex justify-center items-center min-h-screen'>
@@ -19,10 +32,14 @@ function App() {
                 <AudioManager
                     transcriber={transcriber}
                     onSelectedFileChange={setFileName}
+                    audioRef={audioRef}
+                    onTimeUpdate={setCurrentTime}
                 />
                 <Transcript
                     transcribedData={transcriber.output}
                     fileName={fileName}
+                    currentTime={currentTime}
+                    onSeek={seekTo}
                 />
             </div>
 

@@ -1,8 +1,12 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useWorker } from "./useWorker";
 import Constants from "../utils/Constants";
 import { audioBufferToWav } from "../utils/AudioUtils";
 import { transcribeViaApi } from "../utils/ApiClient";
+import {
+    TranslationEngine,
+    translateLinesWithContext,
+} from "../utils/TranslationClient";
 
 interface ProgressItem {
     file: string;
@@ -54,6 +58,8 @@ export interface TranscriberData {
     text: string;
     chunks: Chunk[];
     progress?: TranscribeProgress;
+    /** True when the chunks carry a translation (bilingual subtitles). */
+    bilingual?: boolean;
 }
 
 /**
@@ -64,15 +70,24 @@ export interface TranscriberData {
  */
 export type Engine = "browser" | "local" | "api";
 
+export interface TranslationProgress {
+    done: number;
+    total: number;
+}
+
 export interface Transcriber {
     onInputChange: () => void;
     isBusy: boolean;
     isModelLoading: boolean;
+    /** True while the Bilingual pipeline is translating the transcript. */
+    isTranslating: boolean;
+    translationProgress?: TranslationProgress;
     progressItems: ProgressItem[];
     start: (
         audioData: AudioBuffer | undefined,
         file?: Blob,
         fileName?: string,
+        options?: { bilingual?: boolean },
     ) => void;
     output?: TranscriberData;
     /** Restore a previously computed transcript (used when browsing results). */
@@ -101,6 +116,19 @@ export interface Transcriber {
     localModel: string;
     setLocalModel: (model: string) => void;
     uploadProgress?: number;
+
+    // Translation (used by the "Bilingual subtitles" button)
+    translationEngine: TranslationEngine;
+    setTranslationEngine: (engine: TranslationEngine) => void;
+    /** Target language id, see TRANSLATION_LANGUAGES. */
+    translationTarget: string;
+    setTranslationTarget: (target: string) => void;
+    /** 🤗 model for the browser / local translation engine. */
+    translationModel: string;
+    setTranslationModel: (model: string) => void;
+    /** Chat model for the Server API translation engine. */
+    translationApiModel: string;
+    setTranslationApiModel: (model: string) => void;
 }
 
 const STORAGE_PREFIX = "whisper-web:";
@@ -232,6 +260,34 @@ export function useTranscriber(): Transcriber {
         undefined,
     );
 
+    const [translationEngine, setTranslationEngineState] =
+        useState<TranslationEngine>(() => {
+            const stored = loadSetting(
+                "translationEngine",
+                Constants.DEFAULT_TRANSLATION_ENGINE,
+            );
+            return stored === "local" || stored === "api" ? stored : "browser";
+        });
+    const [translationTarget, setTranslationTargetState] = useState<string>(
+        loadSetting("translationTarget", Constants.DEFAULT_TRANSLATION_TARGET),
+    );
+    const [translationModel, setTranslationModelState] = useState<string>(
+        loadSetting("translationModel", Constants.DEFAULT_TRANSLATION_MODEL),
+    );
+    const [translationApiModel, setTranslationApiModelState] = useState<string>(
+        loadSetting(
+            "translationApiModel",
+            Constants.DEFAULT_TRANSLATION_API_MODEL,
+        ),
+    );
+
+    const [isTranslating, setIsTranslating] = useState(false);
+    const [translationProgress, setTranslationProgress] = useState<
+        TranslationProgress | undefined
+    >(undefined);
+    /** Set while a bilingual run is in flight (transcribe → translate). */
+    const bilingualRef = useRef(false);
+
     const setEngine = useCallback((value: Engine) => {
         saveSetting("engine", value);
         setEngineState(value);
@@ -252,8 +308,114 @@ export function useTranscriber(): Transcriber {
         saveSetting("localModel", value);
         setLocalModelState(value);
     }, []);
+    const setTranslationEngine = useCallback((value: TranslationEngine) => {
+        saveSetting("translationEngine", value);
+        setTranslationEngineState(value);
+    }, []);
+    const setTranslationTarget = useCallback((value: string) => {
+        saveSetting("translationTarget", value);
+        setTranslationTargetState(value);
+    }, []);
+    const setTranslationModel = useCallback((value: string) => {
+        saveSetting("translationModel", value);
+        setTranslationModelState(value);
+    }, []);
+    const setTranslationApiModel = useCallback((value: string) => {
+        saveSetting("translationApiModel", value);
+        setTranslationApiModelState(value);
+    }, []);
+
+    /**
+     * Translate every chunk in place (context aware: the previous lines are
+     * handed to the engine as context).
+     */
+    const translateChunks = useCallback(
+        async (chunks: Chunk[]): Promise<Chunk[]> => {
+            if (!chunks.length) return chunks;
+            setIsTranslating(true);
+            setTranslationProgress({ done: 0, total: chunks.length });
+            try {
+                const lines = chunks.map((chunk) => chunk.text ?? "");
+                const translations = await translateLinesWithContext({
+                    engine: translationEngine,
+                    targetLanguage: translationTarget,
+                    sourceLanguage:
+                        multilingual && language && language !== "auto"
+                            ? language
+                            : "",
+                    model:
+                        translationEngine === "api"
+                            ? translationApiModel
+                            : translationModel,
+                    baseUrl: apiBaseUrl,
+                    apiKey: apiKey,
+                    lines,
+                    onProgress: (done, total) =>
+                        setTranslationProgress({ done, total }),
+                });
+                return chunks.map((chunk, i) => ({
+                    ...chunk,
+                    trans: translations[i] ?? "",
+                }));
+            } finally {
+                setIsTranslating(false);
+                setTranslationProgress(undefined);
+            }
+        },
+        [
+            translationEngine,
+            translationTarget,
+            translationModel,
+            translationApiModel,
+            apiBaseUrl,
+            apiKey,
+            multilingual,
+            language,
+        ],
+    );
+
+    // The in-browser (worker) pipeline reports completion through a worker
+    // message, so its translation step is kicked off from here.
+    useEffect(() => {
+        const output = transcript;
+        if (!output || output.isBusy || isBusy) return;
+        if (!bilingualRef.current || output.bilingual) return;
+        if (!output.chunks?.length) {
+            bilingualRef.current = false;
+            return;
+        }
+
+        let cancelled = false;
+        setIsBusy(true);
+        translateChunks(output.chunks)
+            .then((chunks) => {
+                if (cancelled) return;
+                bilingualRef.current = false;
+                setTranscript({ ...output, chunks, bilingual: true });
+            })
+            .catch((error) => {
+                console.error("translation failed", error);
+                if (cancelled) return;
+                bilingualRef.current = false;
+                alert(
+                    `翻译失败：${error?.message ?? error}\n\n` +
+                        `请检查 Settings → Translation engine（浏览器/本地引擎需要下载模型，Server API 需要可用端点与 Key）。`,
+                );
+                // Mark the run as finished so the queue can advance.
+                setTranscript({ ...output, bilingual: true });
+            })
+            .finally(() => {
+                if (!cancelled) setIsBusy(false);
+            });
+
+        return () => {
+            cancelled = true;
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [transcript, isBusy, translateChunks]);
 
     const onInputChange = useCallback(() => {
+        bilingualRef.current = false;
         setTranscript(undefined);
     }, []);
 
@@ -264,8 +426,6 @@ export function useTranscriber(): Transcriber {
             setTranscript(undefined);
 
             try {
-                // Prefer the original file (keeps mp3/m4a small); fall back to
-                // an encoded WAV for recordings / URL sources.
                 const payload = file ?? audioBufferToWav(audioData);
                 const name = fileName ?? (file ? "audio" : "audio.wav");
 
@@ -287,10 +447,33 @@ export function useTranscriber(): Transcriber {
                     onProgress: (value) => setUploadProgress(value),
                 });
 
+                // Bilingual: transcribe first, then translate the result.
+                const wantBilingual = bilingualRef.current;
+                let chunks = result.chunks;
+                let bilingual = false;
+                if (wantBilingual && chunks.length) {
+                    try {
+                        chunks = await translateChunks(chunks);
+                        bilingual = true;
+                    } catch (translationError: any) {
+                        console.error("translation failed", translationError);
+                        alert(
+                            `翻译失败：${
+                                translationError?.message ?? translationError
+                            }`,
+                        );
+                        // Still finish the run so a batch can advance; the
+                        // chunks simply keep their empty `trans`.
+                        bilingual = true;
+                    }
+                }
+                bilingualRef.current = false;
+
                 setTranscript({
                     isBusy: false,
                     text: result.text,
-                    chunks: result.chunks,
+                    chunks,
+                    bilingual,
                     progress: {
                         value: 1,
                         processed: audioData.duration,
@@ -321,6 +504,7 @@ export function useTranscriber(): Transcriber {
             language,
             multilingual,
             subtask,
+            translateChunks,
         ],
     );
 
@@ -329,8 +513,13 @@ export function useTranscriber(): Transcriber {
             audioData: AudioBuffer | undefined,
             file?: Blob,
             fileName?: string,
+            options?: { bilingual?: boolean },
         ) => {
             if (!audioData) return;
+
+            // Remember the request so the translation step can pick it up once
+            // the transcript arrives (worker path) or immediately (API path).
+            bilingualRef.current = Boolean(options?.bilingual);
 
             if (engine === "api" || engine === "local") {
                 await transcribeWithApi(audioData, file, fileName);
@@ -382,6 +571,8 @@ export function useTranscriber(): Transcriber {
             onInputChange,
             isBusy,
             isModelLoading,
+            isTranslating,
+            translationProgress,
             progressItems,
             start: postRequest,
             output: transcript,
@@ -407,10 +598,20 @@ export function useTranscriber(): Transcriber {
             localModel,
             setLocalModel,
             uploadProgress,
+            translationEngine,
+            setTranslationEngine,
+            translationTarget,
+            setTranslationTarget,
+            translationModel,
+            setTranslationModel,
+            translationApiModel,
+            setTranslationApiModel,
         };
     }, [
         isBusy,
         isModelLoading,
+        isTranslating,
+        translationProgress,
         progressItems,
         postRequest,
         transcript,
@@ -430,6 +631,14 @@ export function useTranscriber(): Transcriber {
         localModel,
         setLocalModel,
         uploadProgress,
+        translationEngine,
+        setTranslationEngine,
+        translationTarget,
+        setTranslationTarget,
+        translationModel,
+        setTranslationModel,
+        translationApiModel,
+        setTranslationApiModel,
     ]);
 
     return transcriber;
