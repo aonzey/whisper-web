@@ -77,10 +77,15 @@ export interface TranslationProgress {
 
 export interface Transcriber {
     onInputChange: () => void;
+    /** Transcription or translation is running (blocks the UI). */
     isBusy: boolean;
+    /** Only the transcription step is running — drives the Transcribe button. */
+    isTranscribing: boolean;
     isModelLoading: boolean;
     /** True while the Bilingual pipeline is translating the transcript. */
     isTranslating: boolean;
+    /** True when the job currently running was started by "Bilingual". */
+    bilingualRun: boolean;
     translationProgress?: TranslationProgress;
     progressItems: ProgressItem[];
     start: (
@@ -129,6 +134,11 @@ export interface Transcriber {
     /** Chat model for the Server API translation engine. */
     translationApiModel: string;
     setTranslationApiModel: (model: string) => void;
+    /**
+     * Translate a transcript that is already on screen — the "Bilingual
+     * subtitles" button calls this instead of transcribing the audio again.
+     */
+    translateExisting: (chunks?: Chunk[]) => void;
 }
 
 const STORAGE_PREFIX = "whisper-web:";
@@ -154,6 +164,7 @@ export function useTranscriber(): Transcriber {
         undefined,
     );
     const [isBusy, setIsBusy] = useState(false);
+    const [isTranscribing, setIsTranscribing] = useState(false);
     const [isModelLoading, setIsModelLoading] = useState(false);
 
     const [progressItems, setProgressItems] = useState<ProgressItem[]>([]);
@@ -187,7 +198,6 @@ export function useTranscriber(): Transcriber {
                 break;
             case "complete":
                 // Received complete transcript
-                // console.log("complete", message);
                 // eslint-disable-next-line no-case-declarations
                 const completeMessage = message as TranscriberCompleteData;
                 setTranscript({
@@ -196,6 +206,9 @@ export function useTranscriber(): Transcriber {
                     chunks: completeMessage.data.chunks,
                     progress: completeMessage.progress,
                 });
+                // Only the ASR pass is over — a bilingual run still has to
+                // translate, which flips `isBusy` back on.
+                setIsTranscribing(false);
                 setIsBusy(false);
                 break;
 
@@ -209,6 +222,8 @@ export function useTranscriber(): Transcriber {
                 break;
             case "error":
                 setIsBusy(false);
+                setIsTranscribing(false);
+                setBilingualRun(false);
                 alert(
                     `${message.data.message} This is most likely because you are using Safari on an M1/M2 Mac. Please try again from Chrome, Firefox, or Edge.\n\nIf this is not the case, please file a bug report.`,
                 );
@@ -287,6 +302,8 @@ export function useTranscriber(): Transcriber {
     >(undefined);
     /** Set while a bilingual run is in flight (transcribe → translate). */
     const bilingualRef = useRef(false);
+    /** Does the job currently running belong to the "Bilingual" button? */
+    const [bilingualRun, setBilingualRun] = useState(false);
 
     const setEngine = useCallback((value: Engine) => {
         saveSetting("engine", value);
@@ -374,6 +391,54 @@ export function useTranscriber(): Transcriber {
         ],
     );
 
+    /**
+     * Translate a transcript that is already computed — the "Bilingual
+     * subtitles" button uses this so clicking it after a plain transcription
+     * does not run (and pay for) the ASR pass a second time.
+     */
+    const translateExisting = useCallback(
+        (chunks?: Chunk[]) => {
+            const source = chunks ?? transcript?.chunks ?? [];
+            if (!source.length) return;
+
+            const text = source
+                .map((chunk) => chunk.text ?? "")
+                .join("")
+                .trim();
+
+            setIsBusy(true);
+            setBilingualRun(true);
+            translateChunks(source)
+                .then((translated) => {
+                    setTranscript({
+                        isBusy: false,
+                        text,
+                        chunks: translated,
+                        bilingual: true,
+                    });
+                })
+                .catch((error) => {
+                    console.error("translation failed", error);
+                    alert(
+                        `翻译失败：${error?.message ?? error}\n\n` +
+                            `请检查 Settings → Translation engine（浏览器/本地引擎需要下载模型，Server API 需要可用端点与 Key）。`,
+                    );
+                    // Keep the untranslated transcript on screen.
+                    setTranscript({
+                        isBusy: false,
+                        text,
+                        chunks: source,
+                        bilingual: true,
+                    });
+                })
+                .finally(() => {
+                    setIsBusy(false);
+                    setBilingualRun(false);
+                });
+        },
+        [transcript, translateChunks],
+    );
+
     // The in-browser (worker) pipeline reports completion through a worker
     // message, so its translation step is kicked off from here.
     useEffect(() => {
@@ -405,7 +470,9 @@ export function useTranscriber(): Transcriber {
                 setTranscript({ ...output, bilingual: true });
             })
             .finally(() => {
-                if (!cancelled) setIsBusy(false);
+                if (cancelled) return;
+                setBilingualRun(false);
+                setIsBusy(false);
             });
 
         return () => {
@@ -416,12 +483,14 @@ export function useTranscriber(): Transcriber {
 
     const onInputChange = useCallback(() => {
         bilingualRef.current = false;
+        setBilingualRun(false);
         setTranscript(undefined);
     }, []);
 
     const transcribeWithApi = useCallback(
         async (audioData: AudioBuffer, file?: Blob, fileName?: string) => {
             setIsBusy(true);
+            setIsTranscribing(true);
             setUploadProgress(0);
             setTranscript(undefined);
 
@@ -451,6 +520,7 @@ export function useTranscriber(): Transcriber {
                 const wantBilingual = bilingualRef.current;
                 let chunks = result.chunks;
                 let bilingual = false;
+                setIsTranscribing(false);
                 if (wantBilingual && chunks.length) {
                     try {
                         chunks = await translateChunks(chunks);
@@ -492,6 +562,7 @@ export function useTranscriber(): Transcriber {
                 );
             } finally {
                 setIsBusy(false);
+                setIsTranscribing(false);
                 setUploadProgress(undefined);
             }
         },
@@ -520,6 +591,7 @@ export function useTranscriber(): Transcriber {
             // Remember the request so the translation step can pick it up once
             // the transcript arrives (worker path) or immediately (API path).
             bilingualRef.current = Boolean(options?.bilingual);
+            setBilingualRun(Boolean(options?.bilingual));
 
             if (engine === "api" || engine === "local") {
                 await transcribeWithApi(audioData, file, fileName);
@@ -528,6 +600,7 @@ export function useTranscriber(): Transcriber {
 
             setTranscript(undefined);
             setIsBusy(true);
+            setIsTranscribing(true);
 
             let audio;
             if (audioData.numberOfChannels === 2) {
@@ -570,11 +643,14 @@ export function useTranscriber(): Transcriber {
         return {
             onInputChange,
             isBusy,
+            isTranscribing,
             isModelLoading,
             isTranslating,
+            bilingualRun,
             translationProgress,
             progressItems,
             start: postRequest,
+            translateExisting,
             output: transcript,
             setOutput: setTranscript,
             model,
@@ -609,11 +685,14 @@ export function useTranscriber(): Transcriber {
         };
     }, [
         isBusy,
+        isTranscribing,
         isModelLoading,
         isTranslating,
+        bilingualRun,
         translationProgress,
         progressItems,
         postRequest,
+        translateExisting,
         transcript,
         model,
         multilingual,

@@ -10,6 +10,8 @@ export interface Props {
     submitEnabled?: boolean;
     title: string | JSX.Element;
     content: string | JSX.Element;
+    /** Override the panel width, e.g. "max-w-4xl" for two-column content. */
+    panelClassName?: string;
 }
 
 export default function Modal({
@@ -20,6 +22,7 @@ export default function Modal({
     content,
     submitText,
     submitEnabled = true,
+    panelClassName,
 }: Props) {
     return (
         <Transition appear show={show} as={Fragment}>
@@ -47,7 +50,11 @@ export default function Modal({
                             leaveFrom='opacity-100 scale-100'
                             leaveTo='opacity-0 scale-95'
                         >
-                            <Dialog.Panel className='w-full max-w-md transform overflow-hidden rounded-2xl bg-white p-6 text-left align-middle shadow-xl transition-all'>
+                            <Dialog.Panel
+                                className={`w-full transform overflow-hidden rounded-2xl bg-white p-6 text-left align-middle shadow-xl transition-all ${
+                                    panelClassName ?? "max-w-md"
+                                }`}
+                            >
                                 <Dialog.Title
                                     as='h3'
                                     className='text-lg font-medium leading-6 text-gray-900'

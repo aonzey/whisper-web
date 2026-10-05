@@ -1,6 +1,9 @@
 interface Props extends React.ButtonHTMLAttributes<HTMLButtonElement> {
     isModelLoading: boolean;
+    /** True when *this* button owns the running job (shows the spinner). */
     isTranscribing: boolean;
+    /** Another button's job is running: grey out but keep the idle label. */
+    blocked?: boolean;
     /** Transcription progress (0 - 1). Undefined -> indeterminate. */
     progress?: number;
     /** Text shown while idle, defaults to "Transcribe Audio". */
@@ -13,6 +16,7 @@ export function TranscribeButton(props: Props): JSX.Element {
     const {
         isModelLoading,
         isTranscribing,
+        blocked,
         progress,
         idleText,
         busyText,
@@ -28,14 +32,14 @@ export function TranscribeButton(props: Props): JSX.Element {
         <button
             {...buttonProps}
             onClick={(event) => {
-                if (onClick && !isTranscribing && !isModelLoading) {
+                if (onClick && !isTranscribing && !isModelLoading && !blocked) {
                     onClick(event);
                 }
             }}
-            disabled={isTranscribing}
+            disabled={isTranscribing || Boolean(blocked)}
             className={
                 className ??
-                "text-white bg-blue-700 hover:bg-blue-800 focus:ring-4 focus:ring-blue-300 font-medium rounded-lg text-sm px-5 py-2.5 text-center mr-2 dark:bg-blue-600 dark:hover:bg-blue-700 dark:focus:ring-blue-800 inline-flex items-center"
+                "text-white bg-blue-700 hover:bg-blue-800 focus:ring-4 focus:ring-blue-300 font-medium rounded-lg text-sm px-5 py-2.5 text-center mr-2 dark:bg-blue-600 dark:hover:bg-blue-700 dark:focus:ring-blue-800 inline-flex items-center disabled:opacity-60 disabled:cursor-not-allowed"
             }
         >
             {isModelLoading ? (

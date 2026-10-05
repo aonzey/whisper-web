@@ -202,9 +202,10 @@ export function AudioManager(props: {
 
     const itemsRef = useRef<AudioItem[]>([]);
     const selectedIdRef = useRef<string | undefined>(undefined);
-    const batchRef = useRef<{ running: boolean; index: number } | undefined>(
-        undefined,
-    );
+    const batchRef = useRef<
+        | { running: boolean; index: number; ids: string[]; bilingual: boolean }
+        | undefined
+    >(undefined);
     /** Does the current run also translate (Bilingual subtitles)? */
     const batchBilingualRef = useRef(false);
     const lastOutputRef = useRef<unknown>(undefined);
@@ -281,6 +282,41 @@ export function AudioManager(props: {
         });
     };
 
+    /**
+     * A file that already carries a transcript does not need the (expensive)
+     * ASR pass again — just translate what is there.
+     */
+    const hasTranscript = (item?: AudioItem) =>
+        (item?.result?.chunks ?? []).some(
+            (chunk) => String(chunk.text ?? "").trim().length > 0,
+        );
+
+    const startTranslateOnly = (item: AudioItem) => {
+        setSelectedId(item.id);
+        selectedIdRef.current = item.id;
+        props.onSelectedFileChange?.(item.name);
+        props.transcriber.translateExisting(item.result?.chunks);
+    };
+
+    /** Start (or continue) the queue at `index`. */
+    const runStep = (index: number) => {
+        const currentBatch = batchRef.current;
+        if (!currentBatch) return;
+        const id = currentBatch.ids[index];
+        const item = itemsRef.current.find((entry) => entry.id === id);
+        if (!item) return;
+        currentBatch.index = index;
+        setBatch({ index, total: currentBatch.ids.length });
+        setSelectedId(id);
+        selectedIdRef.current = id;
+        props.onSelectedFileChange?.(item.name);
+        if (currentBatch.bilingual && hasTranscript(item)) {
+            startTranslateOnly(item);
+        } else {
+            startTranscribe(item);
+        }
+    };
+
     // Handle a finished transcription: store the result and (in batch mode)
     // move on to the next file. In bilingual mode we wait for the translation
     // step to complete first.
@@ -296,27 +332,19 @@ export function AudioManager(props: {
         const currentBatch = batchRef.current;
 
         if (currentBatch && currentBatch.running) {
-            const list = itemsRef.current.filter(
-                (item) => item.status !== "error",
-            );
-            const current = list[currentBatch.index];
-            if (current) {
+            const id = currentBatch.ids[currentBatch.index];
+            if (id) {
                 updateItems((prev) =>
                     prev.map((item) =>
-                        item.id === current.id
+                        item.id === id
                             ? { ...item, status: "done", result }
                             : item,
                     ),
                 );
             }
             const next = currentBatch.index + 1;
-            if (next < list.length) {
-                currentBatch.index = next;
-                setBatch({ index: next, total: list.length });
-                setSelectedId(list[next].id);
-                selectedIdRef.current = list[next].id;
-                props.onSelectedFileChange?.(list[next].name);
-                startTranscribe(list[next]);
+            if (next < currentBatch.ids.length) {
+                runStep(next);
             } else {
                 batchRef.current = undefined;
                 setBatch(undefined);
@@ -496,11 +524,11 @@ export function AudioManager(props: {
         }
     }, [audioDownloadUrl]);
 
-    const runQueue = (bilingual: boolean) => {
+    const runTranscribeQueue = () => {
         const list = items.filter((item) => item.status !== "error");
         if (list.length === 0) return;
 
-        batchBilingualRef.current = bilingual;
+        batchBilingualRef.current = false;
 
         if (list.length === 1) {
             startTranscribe(list[0]);
@@ -508,16 +536,45 @@ export function AudioManager(props: {
         }
 
         // Batch mode: transcribe every file one after another
-        batchRef.current = { running: true, index: 0 };
-        setBatch({ index: 0, total: list.length });
-        setSelectedId(list[0].id);
-        selectedIdRef.current = list[0].id;
-        props.onSelectedFileChange?.(list[0].name);
-        startTranscribe(list[0]);
+        batchRef.current = {
+            running: true,
+            index: 0,
+            ids: list.map((item) => item.id),
+            bilingual: false,
+        };
+        runStep(0);
     };
 
-    const onTranscribeClick = () => runQueue(false);
-    const onBilingualClick = () => runQueue(true);
+    /**
+     * "Bilingual subtitles": reuse an existing transcript when there is one and
+     * only run the translation step. Files without a result still go through
+     * the normal transcribe → translate pipeline.
+     */
+    const runBilingualQueue = () => {
+        const list = items.filter((item) => item.status !== "error");
+        if (list.length === 0) return;
+
+        batchBilingualRef.current = true;
+
+        // Single file that is already transcribed: translate in place.
+        if (list.length === 1 && hasTranscript(list[0])) {
+            batchRef.current = undefined;
+            setBatch(undefined);
+            startTranslateOnly(list[0]);
+            return;
+        }
+
+        batchRef.current = {
+            running: true,
+            index: 0,
+            ids: list.map((item) => item.id),
+            bilingual: true,
+        };
+        runStep(0);
+    };
+
+    const onTranscribeClick = () => runTranscribeQueue();
+    const onBilingualClick = () => runBilingualQueue();
 
     const doneItems = items.filter((item) => item.result);
     // Any stored result that carries a translation is exported bilingually.
@@ -712,8 +769,13 @@ export function AudioManager(props: {
                         <TranscribeButton
                             onClick={onTranscribeClick}
                             isModelLoading={props.transcriber.isModelLoading}
-                            // isAudioLoading ||
-                            isTranscribing={props.transcriber.isBusy}
+                            // Only lit while a *plain* transcription runs.
+                            isTranscribing={
+                                props.transcriber.isBusy &&
+                                !props.transcriber.bilingualRun
+                            }
+                            // Greyed out (but not spinning) during a bilingual run.
+                            blocked={props.transcriber.bilingualRun}
                             progress={progressValue}
                             idleText={
                                 items.length > 1
@@ -724,20 +786,39 @@ export function AudioManager(props: {
 
                         <TranscribeButton
                             onClick={onBilingualClick}
-                            isModelLoading={props.transcriber.isModelLoading}
-                            isTranscribing={props.transcriber.isBusy}
+                            isModelLoading={
+                                props.transcriber.isModelLoading &&
+                                props.transcriber.bilingualRun
+                            }
+                            isTranscribing={props.transcriber.bilingualRun}
+                            blocked={
+                                props.transcriber.isBusy &&
+                                !props.transcriber.bilingualRun
+                            }
                             progress={
                                 props.transcriber.isTranslating
                                     ? translationProgressValue
-                                    : progressValue
+                                    : props.transcriber.bilingualRun
+                                    ? progressValue
+                                    : undefined
                             }
                             idleText={
                                 items.length > 1
                                     ? `Bilingual All (${items.length})`
+                                    : hasTranscript(
+                                          items.find(
+                                              (item) => item.id === selectedId,
+                                          ) ?? items[0],
+                                      )
+                                    ? "Bilingual subtitles (translate only)"
                                     : "Bilingual subtitles"
                             }
-                            busyText='Translating...'
-                            className='text-white bg-indigo-600 hover:bg-indigo-700 focus:ring-4 focus:ring-indigo-300 font-medium rounded-lg text-sm px-5 py-2.5 text-center mr-2 dark:bg-indigo-500 dark:hover:bg-indigo-600 dark:focus:ring-indigo-800 inline-flex items-center'
+                            busyText={
+                                props.transcriber.isTranslating
+                                    ? "Translating..."
+                                    : "Transcribing..."
+                            }
+                            className='text-white bg-indigo-600 hover:bg-indigo-700 focus:ring-4 focus:ring-indigo-300 font-medium rounded-lg text-sm px-5 py-2.5 text-center mr-2 dark:bg-indigo-500 dark:hover:bg-indigo-600 dark:focus:ring-indigo-800 inline-flex items-center disabled:opacity-60 disabled:cursor-not-allowed'
                         />
 
                         <SettingsTile
@@ -831,6 +912,8 @@ function SettingsModal(props: {
     const [testing, setTesting] = useState(false);
     const [serverModels, setServerModels] = useState<ApiModelOption[]>([]);
     const [modelsStatus, setModelsStatus] = useState<string>("");
+    const [translationModelsStatus, setTranslationModelsStatus] =
+        useState<string>("");
     const [loadingModels, setLoadingModels] = useState(false);
     const [customModel, setCustomModel] = useState(false);
     const [customTranslationModel, setCustomTranslationModel] = useState(false);
@@ -854,11 +937,11 @@ function SettingsModal(props: {
         : props.transcriber.setApiModel;
 
     const loadModels = useCallback(async () => {
-        if (!usesServer) return;
         // Listing a third party endpoint's models needs its key.
         if (apiTarget.kind === "openai" && !props.transcriber.apiKey) {
             setServerModels([]);
             setModelsStatus("填写 API Key 后自动拉取上游模型列表");
+            setTranslationModelsStatus("填写 API Key 后自动拉取上游模型列表");
             return;
         }
         setLoadingModels(true);
@@ -869,34 +952,47 @@ function SettingsModal(props: {
         );
         setLoadingModels(false);
         if (result.ok) {
-            const cachedCount = result.options.filter((o) => o.cached).length;
             setServerModels(result.options);
             setModelsStatus(
                 result.options.length === 0
                     ? "服务端未返回任何模型"
-                    : `已加载 ${result.options.length} 个选项（${cachedCount} 个已缓存）`,
+                    : `已加载 ${result.options.length} 个选项（${
+                          result.options.filter(
+                              (o) => o.task !== "translation" && o.cached,
+                          ).length
+                      } 个转写模型已缓存）`,
+            );
+            setTranslationModelsStatus(
+                result.options.length === 0
+                    ? "服务端未返回任何模型"
+                    : `已加载 ${
+                          result.options.filter((o) => o.task === "translation")
+                              .length
+                      } 个已缓存翻译模型`,
             );
         } else {
             setServerModels([]);
-            setModelsStatus(
+            const message =
                 apiTarget.kind === "openai"
                     ? `无法读取上游模型列表（${result.error}），以下为常见模型名`
-                    : `无法读取服务端模型列表（${result.error}），以下为内置别名`,
-            );
+                    : `无法读取服务端模型列表（${result.error}），以下为内置别名`;
+            setModelsStatus(message);
+            setTranslationModelsStatus(message);
         }
     }, [
-        usesServer,
         apiTarget.kind,
         props.transcriber.apiBaseUrl,
         props.transcriber.apiKey,
     ]);
 
     // Pull the model list from the server so the local engine can offer the
-    // models whose weights are actually cached.
+    // models whose weights are actually cached. The translation engine needs it
+    // too (its models live in a separate cache folder).
+    const needsServerModels = usesServer || translationEngine === "local";
     useEffect(() => {
-        if (!props.show || !usesServer) return;
+        if (!props.show || !needsServerModels) return;
         void loadModels();
-    }, [props.show, loadModels]);
+    }, [props.show, needsServerModels, loadModels]);
 
     // Model choices: server list when available, otherwise built-in aliases.
     const fallbackIds =
@@ -1002,413 +1098,486 @@ function SettingsModal(props: {
         <Modal
             show={props.show}
             title={"Settings"}
+            panelClassName='max-w-4xl'
             content={
-                <>
-                    <label>Transcription engine</label>
-                    <select
-                        className='mt-1 mb-3 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:text-white'
-                        value={props.transcriber.engine}
-                        onChange={(e) => {
-                            props.transcriber.setEngine(
-                                e.target.value as Engine,
-                            );
-                        }}
-                    >
-                        <option value={"browser"}>
-                            Browser (in-browser model)
-                        </option>
-                        <option value={"local"}>
-                            本地引擎 Local engine (server)
-                        </option>
-                        <option value={"api"}>Server API</option>
-                    </select>
-
-                    {usesServer && (
-                        <p className='text-xs text-slate-500 mb-2'>
-                            {isServerLocal
-                                ? "本地引擎：由 Node 服务用 transformers.js 转写（权重在服务端 .cache，不占浏览器内存）。"
-                                : apiTarget.kind === "openai"
-                                ? "Server API：把音频转发给你填写的 OpenAI 兼容端点（经本地服务端中转）。"
-                                : "Server API：交给服务端自动选择引擎（openai / command / local）。"}
-                        </p>
-                    )}
-
-                    {usesServer ? (
-                        <>
-                            <label>API base URL</label>
-                            <input
-                                className={inputClass}
-                                value={props.transcriber.apiBaseUrl}
-                                placeholder='/api 或 https://api.groq.com/openai/v1'
-                                onChange={(e) =>
-                                    props.transcriber.setApiBaseUrl(
-                                        e.target.value,
-                                    )
-                                }
-                            />
-                            <p className='text-xs text-slate-400 mb-2'>
-                                {describeApiTarget(apiTarget)}
-                                {apiTarget.kind === "openai" && (
-                                    <>
-                                        <br />
-                                        浏览器无法直连第三方（CORS
-                                        且不走系统代理），请求会经本地服务端中转。
-                                    </>
-                                )}
-                            </p>
-                            <label>API key (optional)</label>
-                            <input
-                                className={inputClass}
-                                type='password'
-                                value={props.transcriber.apiKey}
-                                placeholder='sk-...'
-                                onChange={(e) =>
-                                    props.transcriber.setApiKey(e.target.value)
-                                }
-                            />
-                            <div className='flex items-center justify-between'>
-                                <label>
-                                    Model
-                                    {isServerLocal && (
-                                        <span className='text-xs text-slate-400'>
-                                            （可用服务端已缓存的本地模型）
-                                        </span>
-                                    )}
-                                </label>
-                                <div className='flex items-center space-x-2'>
-                                    {usesServer && (
-                                        <>
-                                            <button
-                                                type='button'
-                                                onClick={() =>
-                                                    void loadModels()
-                                                }
-                                                disabled={loadingModels}
-                                                className='text-slate-500 hover:text-indigo-600 disabled:text-slate-300 text-xs'
-                                            >
-                                                {loadingModels
-                                                    ? "刷新中..."
-                                                    : "刷新列表"}
-                                            </button>
-                                            <button
-                                                type='button'
-                                                onClick={() =>
-                                                    setCustomModel(!customModel)
-                                                }
-                                                className='text-slate-500 hover:text-indigo-600 text-xs'
-                                            >
-                                                {customModel
-                                                    ? "从列表选择"
-                                                    : "手动输入"}
-                                            </button>
-                                        </>
-                                    )}
-                                </div>
-                            </div>
-
-                            {customModel ? (
-                                <input
-                                    className={inputClass}
-                                    value={currentModel}
-                                    placeholder={
-                                        isServerLocal ? "tiny.en" : "whisper-1"
-                                    }
-                                    onChange={(e) =>
-                                        setCurrentModel(e.target.value)
-                                    }
-                                />
-                            ) : (
-                                <select
-                                    className={inputClass}
-                                    value={currentModel}
-                                    onChange={(e) =>
-                                        setCurrentModel(e.target.value)
-                                    }
-                                >
-                                    {!currentInList && (
-                                        <option value={currentModel}>
-                                            {currentModel || "(未选择)"}
-                                            {" — 当前值（不在列表中）"}
-                                        </option>
-                                    )}
-                                    <optgroup label='已缓存（服务端可直接用）'>
-                                        {modelOptions
-                                            .filter((o) => o.cached)
-                                            .map((o) => (
-                                                <option key={o.id} value={o.id}>
-                                                    {o.id} — {o.note}
-                                                </option>
-                                            ))}
-                                    </optgroup>
-                                    <optgroup label='其他可填的模型 / 别名'>
-                                        {modelOptions
-                                            .filter((o) => !o.cached)
-                                            .map((o) => (
-                                                <option key={o.id} value={o.id}>
-                                                    {o.id} — {o.note}
-                                                </option>
-                                            ))}
-                                    </optgroup>
-                                </select>
-                            )}
-                            {usesServer && (
-                                <p
-                                    className={`text-xs mb-2 ${
-                                        serverModels.length
-                                            ? "text-slate-400"
-                                            : "text-amber-600"
-                                    }`}
-                                >
-                                    {modelsStatus}
-                                </p>
-                            )}
-                            <div className='flex items-center space-x-2 mb-2'>
-                                <button
-                                    onClick={onTestApi}
-                                    disabled={testing}
-                                    className='text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 rounded-lg text-xs px-3 py-1.5'
-                                >
-                                    Test connection
-                                </button>
-                                <span className='text-xs text-slate-500 break-all'>
-                                    {apiStatus}
-                                </span>
-                            </div>
-                        </>
-                    ) : (
-                        <>
-                            <label>Select the model to use.</label>
-                            <select
-                                className='mt-1 mb-1 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
-                                defaultValue={props.transcriber.model}
-                                onChange={(e) => {
-                                    props.transcriber.setModel(e.target.value);
-                                }}
-                            >
-                                {Object.keys(models)
-                                    .filter(
-                                        (key) =>
-                                            props.transcriber.quantized ||
-                                            // @ts-ignore
-                                            models[key].length == 2,
-                                    )
-                                    .filter(
-                                        (key) =>
-                                            !props.transcriber.multilingual ||
-                                            !key.startsWith("distil-whisper/"),
-                                    )
-                                    .map((key) => (
-                                        <option key={key} value={key}>{`${key}${
-                                            props.transcriber.multilingual ||
-                                            key.startsWith("distil-whisper/")
-                                                ? ""
-                                                : ".en"
-                                        } (${
-                                            // @ts-ignore
-                                            models[key][
-                                                props.transcriber.quantized
-                                                    ? 0
-                                                    : 1
-                                            ]
-                                        }MB)`}</option>
-                                    ))}
-                            </select>
-                            <div className='flex justify-between items-center mb-3 px-1'>
-                                <div className='flex'>
-                                    <input
-                                        id='multilingual'
-                                        type='checkbox'
-                                        checked={props.transcriber.multilingual}
-                                        onChange={(e) => {
-                                            props.transcriber.setMultilingual(
-                                                e.target.checked,
-                                            );
-                                        }}
-                                    ></input>
-                                    <label
-                                        htmlFor={"multilingual"}
-                                        className='ms-1'
-                                    >
-                                        Multilingual
-                                    </label>
-                                </div>
-                                <div className='flex'>
-                                    <input
-                                        id='quantize'
-                                        type='checkbox'
-                                        checked={props.transcriber.quantized}
-                                        onChange={(e) => {
-                                            props.transcriber.setQuantized(
-                                                e.target.checked,
-                                            );
-                                        }}
-                                    ></input>
-                                    <label
-                                        htmlFor={"quantize"}
-                                        className='ms-1'
-                                    >
-                                        Quantized
-                                    </label>
-                                </div>
-                            </div>
-                        </>
-                    )}
-
-                    {(props.transcriber.multilingual || usesServer) && (
-                        <>
-                            <label>Select the source language.</label>
-                            <select
-                                className='mt-1 mb-3 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
-                                value={props.transcriber.language}
-                                onChange={(e) => {
-                                    props.transcriber.setLanguage(
-                                        e.target.value,
-                                    );
-                                }}
-                            >
-                                {isApi && (
-                                    <option value={"auto"}>Auto detect</option>
-                                )}
-                                {Object.keys(LANGUAGES).map((key, i) => (
-                                    <option key={key} value={key}>
-                                        {names[i]}
-                                    </option>
-                                ))}
-                            </select>
-                            <label>Select the task to perform.</label>
-                            <select
-                                className='mt-1 mb-3 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
-                                value={props.transcriber.subtask}
-                                onChange={(e) => {
-                                    props.transcriber.setSubtask(
-                                        e.target.value,
-                                    );
-                                }}
-                            >
-                                <option value={"transcribe"}>Transcribe</option>
-                                <option value={"translate"}>
-                                    Translate (to English)
-                                </option>
-                            </select>
-                        </>
-                    )}
-
-                    <hr className='my-3 border-slate-200' />
-
-                    <label>Translation engine</label>
-                    <select
-                        className={selectClass}
-                        value={props.transcriber.translationEngine}
-                        onChange={(e) =>
-                            props.transcriber.setTranslationEngine(
-                                e.target.value as TranslationEngine,
-                            )
-                        }
-                    >
-                        <option value={"browser"}>
-                            Browser (in-browser model)
-                        </option>
-                        <option value={"local"}>
-                            本地引擎 Local engine (server)
-                        </option>
-                        <option value={"api"}>Server API</option>
-                    </select>
-                    <p className='text-xs text-slate-500 mb-2'>
-                        {translationEngine === "browser"
-                            ? "浏览器内用 🤗 Transformers.js 翻译模型（首次会下载模型）。"
-                            : translationEngine === "local"
-                            ? "由 Node 服务用 🤗 Transformers.js 翻译（权重在服务端 .cache）。"
-                            : "调用 OpenAI 兼容的 /chat/completions（LLM，上下文语境翻译效果最好）。"}
-                    </p>
-
-                    <label>Translate subtitles into</label>
-                    <select
-                        className={selectClass}
-                        value={props.transcriber.translationTarget}
-                        onChange={(e) =>
-                            props.transcriber.setTranslationTarget(
-                                e.target.value,
-                            )
-                        }
-                    >
-                        {!TRANSLATION_LANGUAGES.some(
-                            (l) => l.id === props.transcriber.translationTarget,
-                        ) && (
-                            <option value={props.transcriber.translationTarget}>
-                                {props.transcriber.translationTarget ||
-                                    "(未选择)"}
-                            </option>
-                        )}
-                        {TRANSLATION_LANGUAGES.map((language) => (
-                            <option key={language.id} value={language.id}>
-                                {language.label}
-                            </option>
-                        ))}
-                    </select>
-
-                    <div className='flex items-center justify-between'>
-                        <label>
-                            Translation model
-                            <span className='text-xs text-slate-400'>
-                                {translationEngine === "api"
-                                    ? "（聊天模型）"
-                                    : "（🤗 翻译模型）"}
-                            </span>
-                        </label>
-                        <button
-                            type='button'
-                            onClick={() => setCustomTranslationModel((v) => !v)}
-                            className='text-slate-500 hover:text-indigo-600 text-xs'
-                        >
-                            {customTranslationModel ? "从列表选择" : "手动输入"}
-                        </button>
-                    </div>
-                    {customTranslationModel ? (
-                        <input
-                            className={inputClass}
-                            value={currentTranslationModel}
-                            onChange={(e) =>
-                                setCurrentTranslationModelValue(e.target.value)
-                            }
-                        />
-                    ) : (
+                <div className='grid grid-cols-1 md:grid-cols-2 gap-4'>
+                    {/* ---------------- Left: transcription ---------------- */}
+                    <section className='border border-slate-200 rounded-lg p-3'>
+                        <h4 className='text-sm font-semibold text-slate-700 mb-2'>
+                            Transcription engine
+                        </h4>
                         <select
                             className={selectClass}
-                            value={currentTranslationModel}
+                            value={props.transcriber.engine}
+                            onChange={(e) => {
+                                props.transcriber.setEngine(
+                                    e.target.value as Engine,
+                                );
+                            }}
+                        >
+                            <option value={"browser"}>
+                                Browser (in-browser model)
+                            </option>
+                            <option value={"local"}>
+                                本地引擎 Local engine (server)
+                            </option>
+                            <option value={"api"}>Server API</option>
+                        </select>
+
+                        {usesServer && (
+                            <p className='text-xs text-slate-500 mb-2'>
+                                {isServerLocal
+                                    ? "本地引擎：由 Node 服务用 transformers.js 转写（权重在服务端 .cache，不占浏览器内存）。"
+                                    : apiTarget.kind === "openai"
+                                    ? "Server API：把音频转发给你填写的 OpenAI 兼容端点（经本地服务端中转）。"
+                                    : "Server API：交给服务端自动选择引擎（openai / command / local）。"}
+                            </p>
+                        )}
+
+                        {usesServer ? (
+                            <>
+                                <label>API base URL</label>
+                                <input
+                                    className={inputClass}
+                                    value={props.transcriber.apiBaseUrl}
+                                    placeholder='/api 或 https://api.groq.com/openai/v1'
+                                    onChange={(e) =>
+                                        props.transcriber.setApiBaseUrl(
+                                            e.target.value,
+                                        )
+                                    }
+                                />
+                                <p className='text-xs text-slate-400 mb-2'>
+                                    {describeApiTarget(apiTarget)}
+                                    {apiTarget.kind === "openai" && (
+                                        <>
+                                            <br />
+                                            浏览器无法直连第三方（CORS
+                                            且不走系统代理），请求会经本地服务端中转。
+                                        </>
+                                    )}
+                                </p>
+                                <label>API key (optional)</label>
+                                <input
+                                    className={inputClass}
+                                    type='password'
+                                    value={props.transcriber.apiKey}
+                                    placeholder='sk-...'
+                                    onChange={(e) =>
+                                        props.transcriber.setApiKey(
+                                            e.target.value,
+                                        )
+                                    }
+                                />
+                                <div className='flex items-center justify-between'>
+                                    <label>
+                                        Model
+                                        {isServerLocal && (
+                                            <span className='text-xs text-slate-400'>
+                                                （可用服务端已缓存的本地模型）
+                                            </span>
+                                        )}
+                                    </label>
+                                    <div className='flex items-center space-x-2'>
+                                        {usesServer && (
+                                            <>
+                                                <button
+                                                    type='button'
+                                                    onClick={() =>
+                                                        void loadModels()
+                                                    }
+                                                    disabled={loadingModels}
+                                                    className='text-slate-500 hover:text-indigo-600 disabled:text-slate-300 text-xs'
+                                                >
+                                                    {loadingModels
+                                                        ? "刷新中..."
+                                                        : "刷新列表"}
+                                                </button>
+                                                <button
+                                                    type='button'
+                                                    onClick={() =>
+                                                        setCustomModel(
+                                                            !customModel,
+                                                        )
+                                                    }
+                                                    className='text-slate-500 hover:text-indigo-600 text-xs'
+                                                >
+                                                    {customModel
+                                                        ? "从列表选择"
+                                                        : "手动输入"}
+                                                </button>
+                                            </>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {customModel ? (
+                                    <input
+                                        className={inputClass}
+                                        value={currentModel}
+                                        placeholder={
+                                            isServerLocal
+                                                ? "tiny.en"
+                                                : "whisper-1"
+                                        }
+                                        onChange={(e) =>
+                                            setCurrentModel(e.target.value)
+                                        }
+                                    />
+                                ) : (
+                                    <select
+                                        className={inputClass}
+                                        value={currentModel}
+                                        onChange={(e) =>
+                                            setCurrentModel(e.target.value)
+                                        }
+                                    >
+                                        {!currentInList && (
+                                            <option value={currentModel}>
+                                                {currentModel || "(未选择)"}
+                                                {" — 当前值（不在列表中）"}
+                                            </option>
+                                        )}
+                                        <optgroup label='已缓存（服务端可直接用）'>
+                                            {modelOptions
+                                                .filter((o) => o.cached)
+                                                .map((o) => (
+                                                    <option
+                                                        key={o.id}
+                                                        value={o.id}
+                                                    >
+                                                        {o.id} — {o.note}
+                                                    </option>
+                                                ))}
+                                        </optgroup>
+                                        <optgroup label='其他可填的模型 / 别名'>
+                                            {modelOptions
+                                                .filter((o) => !o.cached)
+                                                .map((o) => (
+                                                    <option
+                                                        key={o.id}
+                                                        value={o.id}
+                                                    >
+                                                        {o.id} — {o.note}
+                                                    </option>
+                                                ))}
+                                        </optgroup>
+                                    </select>
+                                )}
+                                {usesServer && (
+                                    <p
+                                        className={`text-xs mb-2 ${
+                                            serverModels.length
+                                                ? "text-slate-400"
+                                                : "text-amber-600"
+                                        }`}
+                                    >
+                                        {modelsStatus}
+                                    </p>
+                                )}
+                                <div className='flex items-center space-x-2 mb-2'>
+                                    <button
+                                        onClick={onTestApi}
+                                        disabled={testing}
+                                        className='text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 rounded-lg text-xs px-3 py-1.5'
+                                    >
+                                        Test connection
+                                    </button>
+                                    <span className='text-xs text-slate-500 break-all'>
+                                        {apiStatus}
+                                    </span>
+                                </div>
+                            </>
+                        ) : (
+                            <>
+                                <label>Select the model to use.</label>
+                                <select
+                                    className='mt-1 mb-1 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
+                                    defaultValue={props.transcriber.model}
+                                    onChange={(e) => {
+                                        props.transcriber.setModel(
+                                            e.target.value,
+                                        );
+                                    }}
+                                >
+                                    {Object.keys(models)
+                                        .filter(
+                                            (key) =>
+                                                props.transcriber.quantized ||
+                                                // @ts-ignore
+                                                models[key].length == 2,
+                                        )
+                                        .filter(
+                                            (key) =>
+                                                !props.transcriber
+                                                    .multilingual ||
+                                                !key.startsWith(
+                                                    "distil-whisper/",
+                                                ),
+                                        )
+                                        .map((key) => (
+                                            <option
+                                                key={key}
+                                                value={key}
+                                            >{`${key}${
+                                                props.transcriber
+                                                    .multilingual ||
+                                                key.startsWith(
+                                                    "distil-whisper/",
+                                                )
+                                                    ? ""
+                                                    : ".en"
+                                            } (${
+                                                // @ts-ignore
+                                                models[key][
+                                                    props.transcriber.quantized
+                                                        ? 0
+                                                        : 1
+                                                ]
+                                            }MB)`}</option>
+                                        ))}
+                                </select>
+                                <div className='flex justify-between items-center mb-3 px-1'>
+                                    <div className='flex'>
+                                        <input
+                                            id='multilingual'
+                                            type='checkbox'
+                                            checked={
+                                                props.transcriber.multilingual
+                                            }
+                                            onChange={(e) => {
+                                                props.transcriber.setMultilingual(
+                                                    e.target.checked,
+                                                );
+                                            }}
+                                        ></input>
+                                        <label
+                                            htmlFor={"multilingual"}
+                                            className='ms-1'
+                                        >
+                                            Multilingual
+                                        </label>
+                                    </div>
+                                    <div className='flex'>
+                                        <input
+                                            id='quantize'
+                                            type='checkbox'
+                                            checked={
+                                                props.transcriber.quantized
+                                            }
+                                            onChange={(e) => {
+                                                props.transcriber.setQuantized(
+                                                    e.target.checked,
+                                                );
+                                            }}
+                                        ></input>
+                                        <label
+                                            htmlFor={"quantize"}
+                                            className='ms-1'
+                                        >
+                                            Quantized
+                                        </label>
+                                    </div>
+                                </div>
+                            </>
+                        )}
+
+                        {(props.transcriber.multilingual || usesServer) && (
+                            <>
+                                <label>Select the source language.</label>
+                                <select
+                                    className='mt-1 mb-3 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
+                                    value={props.transcriber.language}
+                                    onChange={(e) => {
+                                        props.transcriber.setLanguage(
+                                            e.target.value,
+                                        );
+                                    }}
+                                >
+                                    {isApi && (
+                                        <option value={"auto"}>
+                                            Auto detect
+                                        </option>
+                                    )}
+                                    {Object.keys(LANGUAGES).map((key, i) => (
+                                        <option key={key} value={key}>
+                                            {names[i]}
+                                        </option>
+                                    ))}
+                                </select>
+                                <label>Select the task to perform.</label>
+                                <select
+                                    className='mt-1 mb-3 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
+                                    value={props.transcriber.subtask}
+                                    onChange={(e) => {
+                                        props.transcriber.setSubtask(
+                                            e.target.value,
+                                        );
+                                    }}
+                                >
+                                    <option value={"transcribe"}>
+                                        Transcribe
+                                    </option>
+                                    <option value={"translate"}>
+                                        Translate (to English)
+                                    </option>
+                                </select>
+                            </>
+                        )}
+                    </section>
+
+                    {/* ---------------- Right: translation ---------------- */}
+                    <section className='border border-slate-200 rounded-lg p-3'>
+                        <h4 className='text-sm font-semibold text-slate-700 mb-2'>
+                            Translation engine
+                        </h4>
+                        <select
+                            className={selectClass}
+                            value={props.transcriber.translationEngine}
                             onChange={(e) =>
-                                setCurrentTranslationModelValue(e.target.value)
+                                props.transcriber.setTranslationEngine(
+                                    e.target.value as TranslationEngine,
+                                )
                             }
                         >
-                            {!translationModelInList && (
-                                <option value={currentTranslationModel}>
-                                    {currentTranslationModel || "(未选择)"}
-                                    {" — 当前值（不在列表中）"}
+                            <option value={"browser"}>
+                                Browser (in-browser model)
+                            </option>
+                            <option value={"local"}>
+                                本地引擎 Local engine (server)
+                            </option>
+                            <option value={"api"}>Server API</option>
+                        </select>
+                        <p className='text-xs text-slate-500 mb-2'>
+                            {translationEngine === "browser"
+                                ? "浏览器内用 🤗 Transformers.js 翻译模型（首次会下载模型）。"
+                                : translationEngine === "local"
+                                ? "由 Node 服务用 🤗 Transformers.js 翻译（权重在服务端 .cache）。"
+                                : "调用 OpenAI 兼容的 /chat/completions（LLM，上下文语境翻译效果最好）。"}
+                        </p>
+
+                        <label>Translate subtitles into</label>
+                        <select
+                            className={selectClass}
+                            value={props.transcriber.translationTarget}
+                            onChange={(e) =>
+                                props.transcriber.setTranslationTarget(
+                                    e.target.value,
+                                )
+                            }
+                        >
+                            {!TRANSLATION_LANGUAGES.some(
+                                (l) =>
+                                    l.id ===
+                                    props.transcriber.translationTarget,
+                            ) && (
+                                <option
+                                    value={props.transcriber.translationTarget}
+                                >
+                                    {props.transcriber.translationTarget ||
+                                        "(未选择)"}
                                 </option>
                             )}
-                            {translationModelOptions.map((option) => (
-                                <option key={option.id} value={option.id}>
-                                    {option.id}
-                                    {option.size
-                                        ? ` — ${option.size}`
-                                        : ""} · {option.note}
+                            {TRANSLATION_LANGUAGES.map((language) => (
+                                <option key={language.id} value={language.id}>
+                                    {language.label}
                                 </option>
                             ))}
                         </select>
-                    )}
-                    {translationEngine === "local" && (
-                        <p className='text-xs text-slate-400 mb-2'>
-                            服务端模型需先下载：npm run fetch-model --{" "}
-                            {currentTranslationModel ||
-                                "Xenova/nllb-200-distilled-600M"}
-                        </p>
-                    )}
-                    {translationEngine === "api" && (
-                        <p className='text-xs text-slate-400 mb-2'>
-                            Server API 翻译复用上方 Server API 的 Base URL 与
-                            API Key，请求经本地服务端中转。
-                        </p>
-                    )}
-                </>
+
+                        <div className='flex items-center justify-between'>
+                            <label>
+                                Translation model
+                                <span className='text-xs text-slate-400'>
+                                    {translationEngine === "api"
+                                        ? "（聊天模型）"
+                                        : "（🤗 翻译模型）"}
+                                </span>
+                            </label>
+                            <div className='flex items-center space-x-2'>
+                                {translationEngine !== "api" && (
+                                    <button
+                                        type='button'
+                                        onClick={() => void loadModels()}
+                                        disabled={loadingModels}
+                                        className='text-slate-500 hover:text-indigo-600 disabled:text-slate-300 text-xs'
+                                    >
+                                        {loadingModels
+                                            ? "刷新中..."
+                                            : "刷新列表"}
+                                    </button>
+                                )}
+                                <button
+                                    type='button'
+                                    onClick={() =>
+                                        setCustomTranslationModel((v) => !v)
+                                    }
+                                    className='text-slate-500 hover:text-indigo-600 text-xs'
+                                >
+                                    {customTranslationModel
+                                        ? "从列表选择"
+                                        : "手动输入"}
+                                </button>
+                            </div>
+                        </div>
+                        {customTranslationModel ? (
+                            <input
+                                className={inputClass}
+                                value={currentTranslationModel}
+                                onChange={(e) =>
+                                    setCurrentTranslationModelValue(
+                                        e.target.value,
+                                    )
+                                }
+                            />
+                        ) : (
+                            <select
+                                className={selectClass}
+                                value={currentTranslationModel}
+                                onChange={(e) =>
+                                    setCurrentTranslationModelValue(
+                                        e.target.value,
+                                    )
+                                }
+                            >
+                                {!translationModelInList && (
+                                    <option value={currentTranslationModel}>
+                                        {currentTranslationModel || "(未选择)"}
+                                        {" — 当前值（不在列表中）"}
+                                    </option>
+                                )}
+                                {translationModelOptions.map((option) => (
+                                    <option key={option.id} value={option.id}>
+                                        {option.id}
+                                        {option.size
+                                            ? ` — ${option.size}`
+                                            : ""}{" "}
+                                        · {option.note}
+                                    </option>
+                                ))}
+                            </select>
+                        )}
+                        {translationEngine !== "api" &&
+                            translationModelsStatus && (
+                                <p className='text-xs text-slate-400 mb-2'>
+                                    {translationModelsStatus}
+                                </p>
+                            )}
+                        {translationEngine === "local" && (
+                            <p className='text-xs text-slate-400 mb-2'>
+                                服务端模型需先下载：npm run fetch-model --{" "}
+                                {currentTranslationModel ||
+                                    "Xenova/nllb-200-distilled-600M"}
+                            </p>
+                        )}
+                        {translationEngine === "api" && (
+                            <p className='text-xs text-slate-400 mb-2'>
+                                Server API 翻译复用左侧 Server API 的 Base URL
+                                与 API Key，请求经本地服务端中转。
+                            </p>
+                        )}
+                    </section>
+                </div>
             }
             onClose={props.onClose}
         />

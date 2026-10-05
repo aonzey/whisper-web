@@ -24,12 +24,11 @@
  * matching config + weight files, and *normalises* them into the layout
  * 🤗 Transformers.js expects:
  *
- *     <cache>/<model-id>/config.json
- *     <cache>/<model-id>/generation_config.json
- *     <cache>/<model-id>/tokenizer.json
- *     ...
- *     <cache>/<model-id>/onnx/encoder_model[_quantized].onnx
- *     <cache>/<model-id>/onnx/decoder_model_merged[_quantized].onnx
+ *     <cache>/Transcription models/<model-id>/...   (Whisper / ASR)
+ *     <cache>/Translation models/<model-id>/...     (opus-mt, nllb, ...)
+ *
+ * The folder is picked automatically (Whisper layout → Transcription models,
+ * anything else → Translation models) and can be forced with `--type=`.
  *
  * Options
  *   --list              只列出仓库里的文件并退出（不下载）
@@ -39,6 +38,8 @@
  *   --mirror=<url>      镜像根地址，例如 https://hf-mirror.com/
  *   --revision=<rev>    分支 / commit（HF 默认 main，ModelScope 默认 master）
  *   --quantized-only    只接受量化权重（没有就直接报错）
+ *   --type=asr|translation
+ *                       强制放到哪个目录；默认自动判断（Whisper → asr）
  *
  * Environment: LOCAL_CACHE_DIR, HF_ENDPOINT, HTTP_PROXY / HTTPS_PROXY / NO_PROXY
  */
@@ -66,9 +67,29 @@ const force = flag("force");
 const quantizedOnly = flag("quantized-only");
 const mirrorArg = option("mirror");
 const revisionArg = option("revision");
+const typeArg = String(option("type") || "").toLowerCase();
 
-const CACHE_DIR =
+const CACHE_ROOT =
     process.env.LOCAL_CACHE_DIR || path.join(process.cwd(), ".cache");
+const ASR_SUBDIR = "Transcription models";
+const MT_SUBDIR = "Translation models";
+/** Where the weights land, decided once the repo layout is known. */
+const dirFor = (category) =>
+    path.join(CACHE_ROOT, category === "translation" ? MT_SUBDIR : ASR_SUBDIR);
+/** Heuristic used before we can read the repo (e.g. --list / fallback). */
+function guessCategory(id) {
+    if (/opus-mt|nllb|m2m100|m2m_100|mbart|mt5|translation|[-_](en|zh|ja|ko|fr|de|ru|es)-(en|zh|ja|ko|fr|de|ru|es)$/i.test(
+        id,
+    )) {
+        return "translation";
+    }
+    return "asr";
+}
+let category =
+    typeArg === "asr" || typeArg === "translation"
+        ? typeArg
+        : guessCategory(modelId);
+let CACHE_DIR = dirFor(category);
 
 // Node's fetch ignores HTTP_PROXY/HTTPS_PROXY — install an env aware dispatcher.
 const PROXY_URL =
@@ -310,7 +331,7 @@ function printList(files) {
 
 async function main() {
     console.log(`model   : ${modelId}`);
-    console.log(`cache   : ${path.join(CACHE_DIR, modelId)}`);
+    console.log(`cache   : ${CACHE_ROOT}`);
     console.log(
         `mirror  : ${mirrors.length === 1 ? mirrors[0].name : "auto (" + mirrors.map((m) => m.name).join(" → ") + ")"}`,
     );
@@ -488,6 +509,15 @@ async function main() {
         process.exit(1);
     }
 
+    // Final folder: Whisper layout → "Transcription models", anything else
+    // (opus-mt / nllb / generic ONNX) → "Translation models".
+    if (!typeArg) {
+        category = isWhisperLayout ? "asr" : "translation";
+        CACHE_DIR = dirFor(category);
+    }
+    console.log(`folder  : ${path.join(CACHE_DIR, modelId)}  [${category}]`);
+    console.log("");
+
     for (const weight of weights) {
         for (const extra of externalDataFor(files, weight.source)) {
             const suffix = basename(extra.path).slice(
@@ -572,7 +602,8 @@ async function main() {
         (w) => w.base !== undefined && w.note === "量化",
     );
     console.log(
-        `done. 启动服务：WHISPER_ENGINE=local 或请求里带 -F engine=local -F model=${modelId}`,
+        `done. 权重目录：${path.join(CACHE_DIR, modelId)}\n` +
+            `     启动服务：WHISPER_ENGINE=local 或请求里带 -F engine=local -F model=${modelId}`,
     );
     if (!usedQuantized) {
         console.log(

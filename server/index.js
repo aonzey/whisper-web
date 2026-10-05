@@ -78,8 +78,25 @@ const ALLOW_UPSTREAM_OVERRIDE =
     String(process.env.ALLOW_UPSTREAM_OVERRIDE || "1").toLowerCase() !== "0";
 const LOCAL_DEFAULT_MODEL =
     process.env.LOCAL_MODEL || "Xenova/whisper-tiny.en";
-const LOCAL_CACHE_DIR =
+/**
+ * Root of the on-disk model cache. Two sub-folders keep the two model
+ * families apart — they are both `encoder_model*.onnx` shaped, so a flat
+ * layout makes it impossible to tell a translation model from a Whisper one
+ * without reading every config.json:
+ *
+ *     <cache>/Transcription models/<model-id>/...
+ *     <cache>/Translation models/<model-id>/...
+ *
+ * The old flat `<cache>/<model-id>/...` layout is still discovered (read
+ * only) so caches downloaded before the split keep working.
+ */
+const CACHE_ROOT =
     process.env.LOCAL_CACHE_DIR || path.join(process.cwd(), ".cache");
+const ASR_SUBDIR = "Transcription models";
+const MT_SUBDIR = "Translation models";
+const ASR_CACHE_DIR = path.join(CACHE_ROOT, ASR_SUBDIR);
+const MT_CACHE_DIR = path.join(CACHE_ROOT, MT_SUBDIR);
+const LOCAL_CACHE_DIR = CACHE_ROOT;
 // When true the `local` engine never touches the network (weights must already
 // be in LOCAL_CACHE_DIR — see `npm run fetch-model`).
 const LOCAL_OFFLINE = String(
@@ -158,8 +175,35 @@ function toLocalModelId(model) {
     return model;
 }
 
+/** Does `dir` look like a transformers.js model folder? */
+function looksLikeModelDir(dir) {
+    return (
+        fs.existsSync(path.join(dir, "onnx")) ||
+        fs.existsSync(path.join(dir, "config.json"))
+    );
+}
+
+/**
+ * Where does `model` actually live? Returns the cache root (what
+ * transformers.js needs as `cache_dir`) and the model folder itself.
+ * `prefer` decides the root when the model is not downloaded yet.
+ */
+function resolveModelDir(model, prefer = "asr") {
+    const fallback = prefer === "translation" ? MT_CACHE_DIR : ASR_CACHE_DIR;
+    if (!model || model.includes("..")) {
+        return { root: fallback, dir: path.join(fallback, model ?? "") };
+    }
+    for (const root of [ASR_CACHE_DIR, MT_CACHE_DIR, CACHE_ROOT]) {
+        const dir = path.join(root, model);
+        if (fs.existsSync(dir) && looksLikeModelDir(dir)) {
+            return { root, dir };
+        }
+    }
+    return { root: fallback, dir: path.join(fallback, model) };
+}
+
 const localModelPath = (model, file) =>
-    path.join(LOCAL_CACHE_DIR, model, file);
+    path.join(resolveModelDir(model).dir, file);
 
 /** Which weight files are already on disk for `model`? */
 function inspectLocalModel(model) {
@@ -218,24 +262,48 @@ function modelTask(model) {
     return "";
 }
 
-/** Every model id that has usable weights in LOCAL_CACHE_DIR. */
+/** Every model id that has usable weights in the cache. */
 function listLocalModels() {
-    if (!fs.existsSync(LOCAL_CACHE_DIR)) return [];
-    const found = [];
+    const found = new Set();
     const walk = (dir, prefix) => {
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        let entries;
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch (e) {
+            return;
+        }
+        for (const entry of entries) {
             if (!entry.isDirectory()) continue;
+            const full = path.join(dir, entry.name);
             const id = prefix ? `${prefix}/${entry.name}` : entry.name;
-            if (fs.existsSync(localModelPath(id, "onnx/encoder_model.onnx")) ||
-                fs.existsSync(localModelPath(id, "onnx/encoder_model_quantized.onnx"))) {
-                found.push(id);
+            if (looksLikeModelDir(full)) {
+                found.add(id);
                 continue;
             }
-            walk(path.join(dir, entry.name), id);
+            walk(full, id);
         }
     };
-    walk(LOCAL_CACHE_DIR, "");
-    return found;
+
+    walk(ASR_CACHE_DIR, "");
+    walk(MT_CACHE_DIR, "");
+    // Legacy flat layout (`<cache>/<model-id>/...`).
+    let rootEntries = [];
+    try {
+        rootEntries = fs.readdirSync(CACHE_ROOT, { withFileTypes: true });
+    } catch (e) {
+        rootEntries = [];
+    }
+    for (const entry of rootEntries) {
+        if (!entry.isDirectory()) continue;
+        if (entry.name === ASR_SUBDIR || entry.name === MT_SUBDIR) continue;
+        const full = path.join(CACHE_ROOT, entry.name);
+        if (looksLikeModelDir(full)) {
+            found.add(entry.name);
+            continue;
+        }
+        walk(full, entry.name);
+    }
+    return [...found];
 }
 
 function resolveEngine(model, explicit, upstreamBase) {
@@ -335,7 +403,10 @@ async function runLocal({ file, model, language, task, quantized }) {
     const { pipeline, env } = await import("@xenova/transformers");
     env.allowLocalModels = true;
     env.useFSCache = true;
-    env.cacheDir = LOCAL_CACHE_DIR;
+    env.cacheDir = CACHE_ROOT; // fallback for the legacy flat layout
+    // Per model cache folder, passed per call so a concurrent translation
+    // request cannot swap the directory out from under this pipeline.
+    const cacheDir = resolveModelDir(model, "asr").root;
     // Allow mirrors (e.g. https://hf-mirror.com) when the default host is blocked
     env.remoteHost = HF_ENDPOINT;
 
@@ -350,7 +421,7 @@ async function runLocal({ file, model, language, task, quantized }) {
         throw new Error(
             `本地模型 ${model} 的权重不在缓存目录里。` +
                 `请先执行：npm run fetch-model -- ${model}` +
-                `（缓存目录 ${LOCAL_CACHE_DIR}）`,
+                `（缓存目录 ${cacheDir}）`,
         );
     }
     // Respect the weights that are actually present on disk.
@@ -379,6 +450,7 @@ async function runLocal({ file, model, language, task, quantized }) {
             );
             pending = pipeline("automatic-speech-recognition", model, {
                 quantized,
+                cache_dir: cacheDir,
             });
             localPipelines.set(key, pending);
             pending.catch(() => localPipelines.delete(key));
@@ -417,7 +489,7 @@ async function runLocal({ file, model, language, task, quantized }) {
         throw new Error(
             `本地模型 ${model} 加载/推理失败: ${error?.message ?? error}. ` +
                 (haveWeights
-                    ? `权重已存在，检查 ${LOCAL_CACHE_DIR}/${model} 是否完整。`
+                    ? `权重已存在，检查 ${resolveModelDir(model).dir} 是否完整。`
                     : `请先下载权重：npm run fetch-model -- ${model}` +
                       `（如 huggingface.co 不可达可设 HF_ENDPOINT 指向镜像，或用 ` +
                       `--mirror https://www.modelscope.cn 走 ModelScope）。`),
@@ -574,7 +646,8 @@ async function runLocalTranslation({
     const { pipeline, env } = await import("@xenova/transformers");
     env.allowLocalModels = true;
     env.useFSCache = true;
-    env.cacheDir = LOCAL_CACHE_DIR;
+    env.cacheDir = CACHE_ROOT; // fallback for the legacy flat layout
+    const cacheDir = resolveModelDir(model, "translation").root;
     env.remoteHost = HF_ENDPOINT;
 
     const weights = inspectGenericModel(model);
@@ -587,7 +660,7 @@ async function runLocalTranslation({
     if (!weights.exists && offline) {
         throw new Error(
             `本地翻译模型 ${model} 的权重不在缓存目录里。` +
-                `请先执行：npm run fetch-model -- ${model}（缓存目录 ${LOCAL_CACHE_DIR}）`,
+                `请先执行：npm run fetch-model -- ${model}（缓存目录 ${cacheDir}）`,
         );
     }
     if (weights.exists && !weights.quantized) quantized = false;
@@ -595,8 +668,11 @@ async function runLocalTranslation({
     const key = `${model}|${quantized}`;
     let pending = translationPipelines.get(key);
     if (!pending) {
-        console.log(`[translate] loading pipeline ${model}`);
-        pending = pipeline("translation", model, { quantized });
+        console.log(`[translate] loading pipeline ${model} (from ${cacheDir})`);
+        pending = pipeline("translation", model, {
+            quantized,
+            cache_dir: cacheDir,
+        });
         translationPipelines.set(key, pending);
         pending.catch(() => translationPipelines.delete(key));
     }
@@ -1179,7 +1255,9 @@ app.get("/api/health", (req, res) => {
                   ? "local (transformers.js)"
                   : OPENAI_BASE_URL,
         localModels: cached,
-        localCacheDir: LOCAL_CACHE_DIR,
+        localCacheDir: CACHE_ROOT,
+        asrCacheDir: ASR_CACHE_DIR,
+        translationCacheDir: MT_CACHE_DIR,
         localReady: cached.length > 0,
         translation: {
             engines: ["local", "openai"],
@@ -1204,17 +1282,22 @@ app.get("/api/models", requireToken, (req, res) => {
     // Rich per-model info so the UI can mark which ones are actually usable.
     const models = cached.map((id) => {
         const info = inspectLocalModel(id);
+        const generic = inspectGenericModel(id);
         return {
             id,
-            cached: info.exists,
-            quantized: info.quantized,
-            fp32: info.fp32,
-            size: dirSize(path.join(LOCAL_CACHE_DIR, id)),
+            cached: info.exists || generic.exists,
+            quantized: info.quantized || generic.quantized,
+            fp32: info.fp32 || generic.fp32,
+            size: dirSize(resolveModelDir(id).dir),
             // "asr" (whisper family) / "translation" (opus-mt, nllb, ...) /
             // "" when the config cannot be read. Translation models also ship
             // an `encoder_model*.onnx`, so the UI needs this to tell them
             // apart in the model dropdown.
             task: modelTask(id),
+            // Which cache folder the weights live in.
+            folder: path
+                .relative(CACHE_ROOT, resolveModelDir(id).dir)
+                .split(path.sep)[0],
         };
     });
 
@@ -1241,6 +1324,8 @@ app.get("/api/models", requireToken, (req, res) => {
         defaultModel: defaultModel(),
         local: {
             cacheDir: LOCAL_CACHE_DIR,
+            asrCacheDir: ASR_CACHE_DIR,
+            translationCacheDir: MT_CACHE_DIR,
             // Kept as plain strings for backwards compatibility
             available: cached,
             models,

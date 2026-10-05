@@ -205,10 +205,15 @@ ask what you can do for your country.
 
 ### 6. Settings 面板逐项说明
 
+Settings 弹窗**左右并列两栏**：左边 `Transcription engine`，右边
+`Translation engine`，各自独立配置、互不干扰。
+
+### 6.1 左栏：Transcription engine
+
 | 设置项 | 说明 |
 | --- | --- |
 | **Transcription engine** | 见[第 2 节](#2-三种转写引擎该怎么选) |
-| **Model** | 下拉框。服务端引擎下由 `GET /api/models` 填充，分两组：<br>· **已缓存（服务端可直接用）** —— 权重已在 `LOCAL_CACHE_DIR`，带精度与体积<br>· **其他可填的模型 / 别名** —— 未下载，选中会触发下载或报不可用 |
+| **Model** | 下拉框。服务端引擎下由 `GET /api/models` 填充（只列 `task=asr` 的模型），分两组：<br>· **已缓存（服务端可直接用）** —— 权重已在 `.cache/Transcription models`，带精度与体积<br>· **其他可填的模型 / 别名** —— 未下载，选中会触发下载或报不可用 |
 | **刷新列表** | 重新拉取 `/api/models`（下完新模型后点它） |
 | **手动输入** | 切换成文本框，可填写列表里没有的模型 id |
 | **Base URL** | 默认 `/api`（vite 已代理到 8787）。也可填第三方 OpenAI 兼容端点，如 `https://api.groq.com/openai/v1`（见[下节](#接入第三方-openai-兼容端点groq--dashscope-)）。下方会实时显示识别结果 |
@@ -218,9 +223,20 @@ ask what you can do for your country.
 | **Language** | 源语言；`auto` 为自动检测 |
 | **Task** | `transcribe`（原语言）或 `translate`（译成英文） |
 | **Quantized** | 浏览器引擎用量化模型（更小更快，精度略降） |
-| **Translation engine** | `Browser (in-browser model)` / `本地引擎 Local engine (server)` / `Server API`，见[第 8 节](#8-双语字幕-bilingual-subtitles) |
+
+### 6.2 右栏：Translation engine
+
+| 设置项 | 说明 |
+| --- | --- |
+| **Translation engine** | 见[第 8 节](#8-双语字幕-bilingual-subtitles) |
 | **Translate subtitles into** | 目标语言，80+ 种可选（含简体/繁体中文） |
 | **Translation model** | 浏览器/本地引擎选 🤗 翻译模型；Server API 选聊天模型 |
+| **刷新列表** | 重新拉取服务端**翻译**模型（只列 `task=translation` 的），下完新翻译模型后点它 |
+| **手动输入** | 切换成文本框，可填写列表里没有的模型 id |
+
+两个下拉框各显示各的已缓存模型：`/api/models` 会按 `config.json` 的
+`model_type` 给每个模型打 `asr` / `translation` 标签，转写框里不会出现
+`opus-mt` 这类翻译模型，反之亦然。
 
 所有设置存 `localStorage`（前缀 `whisper-web:`），刷新不丢。
 
@@ -244,9 +260,20 @@ ask what you can do for your country.
 ## 8. 双语字幕 Bilingual subtitles
 
 `Transcribe Audio` 按钮旁边就是 `Bilingual subtitles`（批量时为
-`Bilingual All (N)`）。它做两件事：
+`Bilingual All (N)`）。
 
-1. 先完整跑一遍普通转写（用的就是当前 *Transcription engine* 的设置）；
+**两个按钮各显示各的动态效果**：转写中只有 `Transcribe Audio` 转圈并显示
+`Transcribing... n%`，`Bilingual subtitles` 保持原样（只是变灰不可点）；
+反之双语运行时只有它显示 `Transcribing...` / `Translating... n/N`。
+
+**Bilingual 会复用已有的转写结果**：如果当前文件已经转写过（点过
+`Transcribe Audio`），再点 `Bilingual subtitles` 会**跳过 ASR**，直接翻译
+现有字幕——按钮文案也会变成 `Bilingual subtitles (translate only)` 提示你。
+批量模式逐文件判断：有结果的只翻译，没结果的才走「转写 → 翻译」。
+
+除此之外它做两件事：
+
+1. （没有结果时）先完整跑一遍普通转写（用的就是当前 *Transcription engine* 的设置）；
 2. 再按 *Translation engine* 的设置把每句译文填进 `chunk.trans`，
    **按上下文分批翻译**——每批最多 10 句，且把已译好的前 4 句一起交给引擎，
    保证代词、人名、术语前后一致。
@@ -324,10 +351,21 @@ transformers.js 期望的布局：
 | 仓库全是 `.bin` / `.safetensors` | 只有 PyTorch 权重，需先转 ONNX |
 | 只有 fp32 权重 | 会保存为 `onnx/*.onnx`（不带 `_quantized`），服务端自动以非量化方式加载 |
 
-- 输出目录：`<LOCAL_CACHE_DIR|./.cache>/<model_id>/<file>`，正好是
-  transformers.js `FileSystemCache` 的布局。
+- 输出目录按模型用途自动分文件夹，正好是 transformers.js
+  `FileSystemCache` 的布局：
+
+  | 用途 | 目录 |
+  | --- | --- |
+  | 转写模型（Whisper 系列） | `<LOCAL_CACHE_DIR\|./.cache>/Transcription models/<model_id>/` |
+  | 翻译模型（opus-mt / NLLB / m2m100 …） | `<LOCAL_CACHE_DIR\|./.cache>/Translation models/<model_id>/` |
+
+  脚本按仓库 `config.json` 的 `model_type` 判断用途（`whisper` → 转写，
+  其余 → 翻译）；也可用 `--dir "Transcription models"` 手动指定。
+  旧的扁平布局 `<cache>/<model_id>/` 仍会被读取，不会白下载。
 - 默认先走 **ModelScope** 镜像，失败自动回退 huggingface.co。
-- 已缓存的模型会列在 `/api/models` 里，并出现在 Settings 的 Model 下拉框中。
+- 已缓存的模型会列在 `/api/models` 里（带 `task` = `asr` / `translation`），
+  并出现在 Settings 对应的 Model 下拉框中；下完新模型后点下拉框旁的
+  **刷新列表**。
 
 常见模型体积参考（量化版，实测）：
 
@@ -691,6 +729,8 @@ whisper-web/
 │   ├── cli.mjs                     # npm run cli（transcribe / bilingual / models）
 │   └── dev-all.js                  # npm run dev:all
 ├── .cache/                         # 权重缓存（gitignored，可能上 GB）
+│   ├── Transcription models/       #   Whisper / ASR 模型（fetch-model 自动归类）
+│   └── Translation models/         #   opus-mt / NLLB / m2m100 等翻译模型
 └── vite.config.ts                  # /api 代理（server.proxy + preview.proxy）
 ```
 
@@ -703,7 +743,7 @@ whisper-web/
 | `npm run dev` | 只起前端（5173） |
 | `npm run server` | 只起 API（8787） |
 | `npm run dev:all` | 两个一起起 |
-| `npm run fetch-model` | 下载权重到 `.cache/`（支持任意仓库） |
+| `npm run fetch-model` | 下载权重到 `.cache/<Transcription\|Translation> models/`（支持任意仓库，自动归类） |
 | `npm run cli -- <cmd>` | 命令行转写 / 双语 / 查模型 |
 | `npm run build` | `tsc && vite build` |
 | `npm run preview` | 预览构建产物（已配置 `/api` 代理） |
