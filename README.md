@@ -300,13 +300,17 @@ Settings 弹窗**左右并列两栏**：左边 `Transcription engine`，右边
 
 | 选项 | 跑在哪 | 适用 | 准备 |
 | --- | --- | --- | --- |
-| **Browser (in-browser model)** | 浏览器 Web Worker 里的 🤗 Transformers.js | 不想起服务端、机器内存够 | 首次自动下载所选模型（默认 `Xenova/nllb-200-distilled-600M`，约 250MB） |
+| **Browser (in-browser model)** | 浏览器 Web Worker 里的 🤗 Transformers.js | 不想把音频/文本交给后端、机器内存够 | **服务端已缓存的模型会直接经 `/models` 拉进浏览器**，无需再访问 huggingface.co；未缓存的才联网下载 |
 | **本地引擎 Local engine (server)** | Node 服务端进程内 | 完全离线、想复用服务端缓存 | `npm run fetch-model -- Xenova/opus-mt-en-zh` |
 | **Server API** | OpenAI 兼容的 `/chat/completions` | **上下文语境翻译质量最好** | 在右栏填好 **Translation API base URL** + **Translation API key** + 聊天模型（与左侧转写配置互不影响） |
 
 - 浏览器/本地引擎用 🤗 翻译模型（`Xenova/nllb-200-distilled-600M`、
   `Xenova/m2m100_418M`、`Xenova/opus-mt-en-zh` 等），NLLB / m2m100 / mBART
   会自动带上 `src_lang` / `tgt_lang` 语言码。
+- **Browser 引擎也需要 `npm run server` 在跑**：transformers.js 会先请求
+  `/models/<id>/<file>`，命中就直接用服务端 `.cache` 里的权重（几百 MB 走
+  localhost 很快），没命中才回退到 huggingface.co。`npm run dev` 已配好
+  `/models` 代理。首次运行还会从 CDN 取 ONNX Runtime 的 wasm。
 - Server API 走 LLM：提示词要求「按 `<序号>\t<译文>` 逐行输出」，
   解析失败会退化为按行对齐，保证句数不错位。
 - 右栏的 **Prompt（补充要求）** 会作为「用户补充要求」追加进提示词，
@@ -422,6 +426,7 @@ whisper-web API listening on http://localhost:8787
 | `POST` | `/api/transcribe` | 上传音频转写 |
 | `POST` | `/api/bilingual` | 转写 **+ 翻译**，返回双语结果 |
 | `POST` | `/api/translate` | 只翻译：`{ lines, target_language }` → `{ translations }` |
+| `GET` | `/models/<id>/<file>` | 把 `.cache` 里已缓存的 🤗 权重喂给**浏览器引擎**（transformers.js 会先按 `models/{model}/{file}` 试探本地）。没有该路由时这些请求会被 SPA fallback 顶成 `index.html`，浏览器报 `Unexpected token '<' ... is not valid JSON` |
 | `POST` | `/v1/audio/transcriptions` | `/api/transcribe` 的 OpenAI 兼容别名 |
 | `POST` | `/v1/audio/bilingual` | `/api/bilingual` 的别名 |
 | `GET` | `/api/upstream/models` | 查询**第三方**端点的模型列表（`baseUrl` / `apiKey`） |
@@ -911,6 +916,18 @@ Git Bash 里 `pkill -f` 会匹配到**当前这条命令行本身**（因为里�
   不需要；代码已按模型名自动判断。
 - Server API 翻译返回 404：说明那个端点的 `/chat/completions` 不存在
   （只有 `/audio/transcriptions` 的 ASR 端点不能用来翻译）。
+
+**C8. Browser（浏览器）引擎报 `Unexpected token '<', "<!DOCTYPE " ... is not valid JSON`**
+
+浏览器拿到的"模型文件"其实是 HTML。transformers.js 在下载前会先按
+`models/{model}/{file}` 试探本地（相对当前页面地址），如果那个地址把请求
+当成页面请求返回了 `index.html`，它就会把 HTML 当 JSON 解析而崩溃。
+
+- 用 `npm run server`（8787）打开页面：服务端现在有 `/models/*` 路由，
+  直接把 `.cache` 里的权重发给浏览器；
+- 用 `npm run dev`（5173）：vite 已代理 `/models`，但需要 8787 同时在跑；
+- 若之前失败过，坏响应可能已存进浏览器的 `transformers-cache`，worker 会
+  在遇到这类错误时自动清掉该模型的缓存条目，重试一次即可。
 
 **C7. 某个模型一直「在翻译」、CPU 打满，刷新页面也没用**
 

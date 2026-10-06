@@ -1,3 +1,5 @@
+/* eslint-env node */
+/* eslint-disable camelcase */
 /**
  * whisper-web API server
  *
@@ -76,8 +78,7 @@ const COMMAND_TIMEOUT_MS = Number(
 // directly — no CORS, and the server's proxy settings apply).
 const ALLOW_UPSTREAM_OVERRIDE =
     String(process.env.ALLOW_UPSTREAM_OVERRIDE || "1").toLowerCase() !== "0";
-const LOCAL_DEFAULT_MODEL =
-    process.env.LOCAL_MODEL || "Xenova/whisper-tiny.en";
+const LOCAL_DEFAULT_MODEL = process.env.LOCAL_MODEL || "Xenova/whisper-tiny.en";
 /**
  * Root of the on-disk model cache. Two sub-folders keep the two model
  * families apart — they are both `encoder_model*.onnx` shaped, so a flat
@@ -99,13 +100,10 @@ const MT_CACHE_DIR = path.join(CACHE_ROOT, MT_SUBDIR);
 const LOCAL_CACHE_DIR = CACHE_ROOT;
 // When true the `local` engine never touches the network (weights must already
 // be in LOCAL_CACHE_DIR — see `npm run fetch-model`).
-const LOCAL_OFFLINE = String(
-    process.env.LOCAL_OFFLINE || "auto",
-).toLowerCase();
-const HF_ENDPOINT = (process.env.HF_ENDPOINT || "https://huggingface.co/").replace(
-    /\/+$/,
-    "",
-) + "/";
+const LOCAL_OFFLINE = String(process.env.LOCAL_OFFLINE || "auto").toLowerCase();
+const HF_ENDPOINT =
+    (process.env.HF_ENDPOINT || "https://huggingface.co/").replace(/\/+$/, "") +
+    "/";
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 200);
 
 // ---------------------------------------------------------------------------
@@ -236,7 +234,9 @@ const localModelPath = (model, file) =>
 /** Which weight files are already on disk for `model`? */
 function inspectLocalModel(model) {
     const quantized =
-        fs.existsSync(localModelPath(model, "onnx/encoder_model_quantized.onnx")) &&
+        fs.existsSync(
+            localModelPath(model, "onnx/encoder_model_quantized.onnx"),
+        ) &&
         fs.existsSync(
             localModelPath(model, "onnx/decoder_model_merged_quantized.onnx"),
         );
@@ -389,9 +389,10 @@ function defaultModel() {
     if (CONFIGURED_ENGINE === "openai") return OPENAI_MODEL;
     // auto: prefer a model that is actually present on disk
     const cached = listLocalModels();
-    if (cached.length) return cached.includes(LOCAL_DEFAULT_MODEL)
-        ? LOCAL_DEFAULT_MODEL
-        : cached[0];
+    if (cached.length)
+        return cached.includes(LOCAL_DEFAULT_MODEL)
+            ? LOCAL_DEFAULT_MODEL
+            : cached[0];
     return LOCAL_DEFAULT_MODEL;
 }
 
@@ -407,7 +408,11 @@ function normalize(raw, model, engine) {
         trans: segment.trans ?? "",
     }));
     const text =
-        raw?.text ?? chunks.map((chunk) => chunk.text).join("").trim();
+        raw?.text ??
+        chunks
+            .map((chunk) => chunk.text)
+            .join("")
+            .trim();
 
     return {
         text,
@@ -551,7 +556,9 @@ async function runLocal({ file, model, language, task, quantized }) {
         throw new Error(
             `本地模型 ${model} 加载/推理失败: ${error?.message ?? error}. ` +
                 (haveWeights
-                    ? `权重已存在，检查 ${resolveModelDir(model).dir} 是否完整。`
+                    ? `权重已存在，检查 ${
+                          resolveModelDir(model).dir
+                      } 是否完整。`
                     : `请先下载权重：npm run fetch-model -- ${model}` +
                       `（如 huggingface.co 不可达可设 HF_ENDPOINT 指向镜像，或用 ` +
                       `--mirror https://www.modelscope.cn 走 ModelScope）。`),
@@ -565,7 +572,14 @@ async function runLocal({ file, model, language, task, quantized }) {
  * Engine: openai (forward to an OpenAI compatible endpoint)
  * ------------------------------------------------------------------ */
 
-async function forwardToOpenAI({ file, model, language, task, apiKey, baseUrl }) {
+async function forwardToOpenAI({
+    file,
+    model,
+    language,
+    task,
+    apiKey,
+    baseUrl,
+}) {
     const form = new FormData();
     const blob = new Blob([file.buffer], {
         type: file.mimetype || "application/octet-stream",
@@ -600,7 +614,10 @@ async function forwardToOpenAI({ file, model, language, task, apiKey, baseUrl })
         // Surface the upstream payload: model typos (e.g. `whisper-large-v3`
         // vs `whisper-large-v3-turbo`) and bad keys are only visible there.
         throw new Error(
-            `上游 ${response.status} ${response.statusText}: ${body.slice(0, 600)}`,
+            `上游 ${response.status} ${response.statusText}: ${body.slice(
+                0,
+                600,
+            )}`,
         );
     }
     try {
@@ -656,8 +673,7 @@ function runCommand({ file, model, language, task }) {
                         .filter((name) => name.endsWith(".json"))
                         .map((name) => path.join(dir, name));
                     const target =
-                        candidates.find((p) => p === jsonPath) ??
-                        candidates[0];
+                        candidates.find((p) => p === jsonPath) ?? candidates[0];
                     if (!target) {
                         resolve({ text: (stdout || "").trim() });
                         return;
@@ -813,9 +829,12 @@ function inspectGenericModel(model) {
         localModelPath(model, "onnx/encoder_model.onnx"),
     );
     const fp32 =
-        fs.existsSync(localModelPath(model, "onnx/model.onnx")) ||
-        specificFp32;
-    return { exists: quantized || specific || fp32, quantized: quantized || specific, fp32 };
+        fs.existsSync(localModelPath(model, "onnx/model.onnx")) || specificFp32;
+    return {
+        exists: quantized || specific || fp32,
+        quantized: quantized || specific,
+        fp32,
+    };
 }
 
 async function runLocalTranslation({
@@ -928,7 +947,12 @@ async function translateViaChat({
 
     const text = await response.text();
     if (!response.ok) {
-        throw new Error(`上游 ${response.status} ${response.statusText}: ${text.slice(0, 600)}`);
+        throw new Error(
+            `上游 ${response.status} ${response.statusText}: ${text.slice(
+                0,
+                600,
+            )}`,
+        );
     }
     let content = "";
     try {
@@ -1088,9 +1112,7 @@ async function runTranscription(req) {
     const apiKey = useUpstream
         ? upstreamKey || OPENAI_API_KEY || incomingKey
         : OPENAI_API_KEY || incomingKey || "";
-    const effectiveModel = useUpstream && upstreamModel
-        ? upstreamModel
-        : model;
+    const effectiveModel = useUpstream && upstreamModel ? upstreamModel : model;
 
     if (engine === "openai" && !apiKey && !useUpstream) {
         const error = new Error(
@@ -1163,9 +1185,13 @@ function sendTranscription(req, res, result, options = {}) {
             explicitBilingual === "true" ||
             hasTranslations);
 
-    const { body, mime, ext } = exportContent(result.chunks ?? [], requestedFormat, {
-        bilingual,
-    });
+    const { body, mime, ext } = exportContent(
+        result.chunks ?? [],
+        requestedFormat,
+        {
+            bilingual,
+        },
+    );
     const base = (req.file?.originalname || "transcript").replace(
         /\.[^.]+$/,
         "",
@@ -1306,9 +1332,7 @@ async function translateHandler(req, res) {
         // `translation_*` lets a caller keep the translation endpoint separate
         // from the transcription one (the UI does this per request anyway).
         const upstreamBase = String(
-            req.body?.upstream_base_url ||
-                req.body?.translation_base_url ||
-                "",
+            req.body?.upstream_base_url || req.body?.translation_base_url || "",
         ).trim();
         const engine = resolveTranslationEngine(
             String(req.body?.engine ?? "").toLowerCase(),
@@ -1335,7 +1359,9 @@ async function translateHandler(req, res) {
                             req.body?.translation_api_key ||
                             "",
                     ).trim(),
-                    upstreamModel: String(req.body?.upstream_model || "").trim(),
+                    upstreamModel: String(
+                        req.body?.upstream_model || "",
+                    ).trim(),
                     extraPrompt: extraPromptOf(req),
                 }),
                 TRANSLATION_TIMEOUT_MS,
@@ -1395,7 +1421,10 @@ async function queryUpstream(baseUrl, apiKey, path) {
     const body = await response.text();
     if (!response.ok) {
         throw new Error(
-            `上游 ${response.status} ${response.statusText}: ${body.slice(0, 500)}`,
+            `上游 ${response.status} ${response.statusText}: ${body.slice(
+                0,
+                500,
+            )}`,
         );
     }
     try {
@@ -1410,17 +1439,15 @@ function extractModelIds(payload) {
     const list = Array.isArray(payload)
         ? payload
         : Array.isArray(payload?.data)
-          ? payload.data
-          : [];
+        ? payload.data
+        : [];
     return list
         .map((item) => (typeof item === "string" ? item : item?.id))
         .filter((id) => typeof id === "string" && id.length > 0);
 }
 
 app.get("/api/upstream/models", requireToken, async (req, res) => {
-    const baseUrl = String(
-        req.query?.baseUrl ?? req.query?.base_url ?? "",
-    );
+    const baseUrl = String(req.query?.baseUrl ?? req.query?.base_url ?? "");
     if (!baseUrl) {
         return res.status(400).json({ error: "缺少 baseUrl 参数" });
     }
@@ -1437,14 +1464,15 @@ app.get("/api/upstream/models", requireToken, async (req, res) => {
         const rest = all.filter((id) => !audio.includes(id));
         res.json({ ok: true, baseUrl, models: [...audio, ...rest], all });
     } catch (error) {
-        res.status(502).json({ ok: false, error: error?.message ?? String(error) });
+        res.status(502).json({
+            ok: false,
+            error: error?.message ?? String(error),
+        });
     }
 });
 
 app.get("/api/upstream/health", requireToken, async (req, res) => {
-    const baseUrl = String(
-        req.query?.baseUrl ?? req.query?.base_url ?? "",
-    );
+    const baseUrl = String(req.query?.baseUrl ?? req.query?.base_url ?? "");
     if (!baseUrl) {
         return res.status(400).json({ error: "缺少 baseUrl 参数" });
     }
@@ -1482,8 +1510,8 @@ app.get("/api/health", (req, res) => {
             CONFIGURED_ENGINE === "command"
                 ? WHISPER_COMMAND
                 : CONFIGURED_ENGINE === "local" || !CONFIGURED_ENGINE
-                  ? "local (transformers.js)"
-                  : OPENAI_BASE_URL,
+                ? "local (transformers.js)"
+                : OPENAI_BASE_URL,
         localModels: cached,
         localCacheDir: CACHE_ROOT,
         asrCacheDir: ASR_CACHE_DIR,
@@ -1605,12 +1633,90 @@ app.post(
     transcribeHandler,
 );
 
+/* ------------------------------------------------------------------ *
+ * Model files for the browser engine
+ *
+ * Transformers.js probes `env.localModelPath` ("models/") *before* the
+ * remote host when `allowLocalModels` is on, so a page served from this
+ * origin asks for `/models/<id>/<file>`. Those requests used to fall
+ * through to the SPA fallback, which answers with index.html — the browser
+ * then tried to `JSON.parse("< !DOCTYPE html>")` and blew up with
+ * "Unexpected token '<', ... is not valid JSON".
+ *
+ * Serving the weights we already have also means the browser engine no
+ * longer has to re-download hundreds of megabytes from huggingface.co.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Map `/models/<id>/<file>` onto a file inside the local cache.
+ * Returns an absolute path, or null when nothing matches.
+ */
+function resolveModelFile(relative) {
+    const parts = String(relative || "")
+        .split("/")
+        .filter(Boolean);
+    if (parts.length < 2) return null;
+    // A model id is either "tiny" or "org/name", so try the longer id first.
+    for (let i = Math.min(2, parts.length - 1); i >= 1; i--) {
+        const model = parts.slice(0, i).join("/");
+        const file = parts.slice(i).join("/");
+        if (model.includes("..") || file.includes("..")) continue;
+        const { dir } = resolveModelDir(model);
+        const full = path.resolve(dir, file);
+        const root = path.resolve(CACHE_ROOT);
+        // Never escape the cache directory.
+        if (!full.startsWith(root + path.sep) && full !== root) continue;
+        if (fs.existsSync(full) && fs.statSync(full).isFile()) return full;
+    }
+    return null;
+}
+
+// NOTE: Express 5 needs the wildcard to be named ("*splat").
+app.get("/models/*splat", (req, res) => {
+    const relative = decodeURIComponent(
+        req.path.replace(/^\/models\//, "") || "",
+    );
+    const full = resolveModelFile(relative);
+    if (!full) {
+        return res.status(404).json({
+            error: `本地缓存里没有 ${relative}`,
+            hint: "npm run fetch-model -- <model id>",
+        });
+    }
+    // `res.sendFile` goes through the `send` package, which refuses paths
+    // that contain spaces on Windows (our cache folders are named
+    // "Transcription models" / "Translation models") — stream it instead.
+    const stat = fs.statSync(full);
+    const type =
+        path.extname(full).toLowerCase() === ".json"
+            ? "application/json; charset=utf-8"
+            : "application/octet-stream";
+    res.writeHead(200, {
+        "Content-Type": type,
+        "Content-Length": stat.size,
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Accept-Ranges": "bytes",
+    });
+    fs.createReadStream(full)
+        .on("error", () => res.destroy())
+        .pipe(res);
+});
+
 // Serve the production build (npm run build) from the same origin.
 const distPath = path.join(__dirname, "..", "dist");
 if (fs.existsSync(distPath)) {
     app.use(express.static(distPath));
     app.use((req, res, next) => {
         if (req.method !== "GET") return next();
+        // Only real navigations get the SPA shell. Anything that looks like a
+        // file must 404 — returning HTML for a `.json`/`.onnx` request makes
+        // clients parse a document as data and fail with a confusing
+        // "Unexpected token '<'" instead of a clean 404.
+        if (req.path.startsWith("/models/") || path.extname(req.path)) {
+            return res
+                .status(404)
+                .json({ error: `Not found: ${req.originalUrl}` });
+        }
         res.sendFile(path.join(distPath, "index.html"));
     });
 }
@@ -1618,7 +1724,10 @@ if (fs.existsSync(distPath)) {
 app.listen(PORT, () => {
     console.log(`whisper-web API listening on http://localhost:${PORT}`);
     console.log(
-        `  engine : ${CONFIGURED_ENGINE || "auto (local models & tiny/base/... ids -> local, otherwise openai when configured)"}`,
+        `  engine : ${
+            CONFIGURED_ENGINE ||
+            "auto (local models & tiny/base/... ids -> local, otherwise openai when configured)"
+        }`,
     );
     console.log(`  model  : ${defaultModel()}`);
     console.log(`  proxy  : ${PROXY_URL || "none"}`);
