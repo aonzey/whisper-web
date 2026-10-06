@@ -780,7 +780,9 @@ export function AudioManager(props: {
                                 props.transcriber.isBusy &&
                                 !props.transcriber.bilingualRun
                             }
-                            // Greyed out (but not spinning) during a bilingual run.
+                            // Greyed out (but not spinning) during a bilingual
+                            // run: `bilingualRun` is the single source of
+                            // truth and is always cleared when a run ends.
                             blocked={props.transcriber.bilingualRun}
                             progress={progressValue}
                             idleText={

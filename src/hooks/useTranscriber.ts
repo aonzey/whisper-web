@@ -515,6 +515,8 @@ export function useTranscriber(): Transcriber {
         if (!bilingualRef.current || output.bilingual) return;
         if (!output.chunks?.length) {
             bilingualRef.current = false;
+            // Nothing to translate — clear the flag or the buttons stay stuck.
+            setBilingualRun(false);
             return;
         }
         // Already translating this exact transcript — ignore the re-run.
@@ -544,6 +546,18 @@ export function useTranscriber(): Transcriber {
             });
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [transcript, isBusy, translateChunks]);
+
+    /**
+     * Safety net: `bilingualRun` drives both buttons, so a single missed reset
+     * leaves them disabled with "Transcribing..." on screen while nothing is
+     * actually running. Whenever nothing is in flight (and no run is queued in
+     * `bilingualRef`) the flag is cleared here.
+     */
+    useEffect(() => {
+        if (!isBusy && !isTranslating && !bilingualRef.current) {
+            setBilingualRun((prev) => (prev ? false : prev));
+        }
+    }, [isBusy, isTranslating]);
 
     const onInputChange = useCallback(() => {
         bilingualRef.current = false;
@@ -623,20 +637,25 @@ export function useTranscriber(): Transcriber {
                         chunksTotal: 1,
                     },
                 });
-            } catch (error: any) {
-                console.error("API transcription failed", error);
-                setTranscript(undefined);
-                alert(
-                    `Transcription through the server API failed: ${
-                        error?.response?.data?.error ?? error?.message ?? error
-                    }`,
-                );
-            } finally {
-                setIsBusy(false);
-                setIsTranscribing(false);
-                setUploadProgress(undefined);
-            }
-        },
+        } catch (error: any) {
+            console.error("API transcription failed", error);
+            setTranscript(undefined);
+            alert(
+                `Transcription through the server API failed: ${
+                    error?.response?.data?.error ?? error?.message ?? error
+                }`,
+            );
+        } finally {
+            setIsBusy(false);
+            setIsTranscribing(false);
+            setUploadProgress(undefined);
+            // This is the only place a bilingual run through the API / local
+            // engine ends — without it the flag stayed true forever, so both
+            // buttons remained disabled and the Bilingual button kept showing
+            // "Transcribing..." after the translation was already done.
+            setBilingualRun(false);
+        }
+    },
         [
             apiBaseUrl,
             apiKey,
