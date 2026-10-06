@@ -1295,11 +1295,10 @@ function SettingsModal(props: {
                             <>
                                 <div className='flex items-center justify-between'>
                                     <label>
-                                        Model
+                                        Transcription Model
                                         {isServerLocal && (
                                             <span className='text-xs text-slate-400'>
-                                                （.cache\Transcription models
-                                                中已缓存的模型）
+                                                （🤗 转写模型）
                                             </span>
                                         )}
                                     </label>

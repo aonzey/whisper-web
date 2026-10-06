@@ -135,6 +135,34 @@ export interface TranslateOptions {
     onProgress?: (done: number, total: number) => void;
 }
 
+/**
+ * Per-request budget. A translation batch is 10 short lines, so anything past
+ * this is almost always a stuck model download (🤗 engines) or a dead upstream
+ * (Server API) — hanging forever is far worse than a clear error.
+ */
+export const TRANSLATION_TIMEOUT_MS = 120_000;
+
+/** Reject instead of waiting forever when an engine stops answering. */
+function withTimeout<T>(
+    promise: Promise<T>,
+    ms: number,
+    message: string,
+    onTimeout?: () => void,
+): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    return Promise.race([
+        promise,
+        new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+                onTimeout?.();
+                reject(new Error(message));
+            }, ms);
+        }),
+    ]).finally(() => {
+        if (timer) clearTimeout(timer);
+    }) as Promise<T>;
+}
+
 /* ------------------------------------------------------------------ *
  * Server side engines ("local" transformers.js, "api" OpenAI chat)
  * ------------------------------------------------------------------ */
@@ -195,10 +223,31 @@ export async function translateViaServer(
             ? { Authorization: `Bearer ${apiKey}`, "X-API-Key": apiKey }
             : {};
 
-    const { data } = await axios.post(url, payload, {
-        headers,
-        timeout: 0,
-    });
+    let data;
+    try {
+        ({ data } = await axios.post(url, payload, {
+            headers,
+            // 0 means "never time out" — that is how a missing model used to
+            // freeze the whole run forever.
+            timeout: TRANSLATION_TIMEOUT_MS,
+        }));
+    } catch (error: any) {
+        if (
+            error?.code === "ECONNABORTED" ||
+            /timeout/i.test(String(error?.message))
+        ) {
+            throw new Error(
+                `翻译请求超时（${TRANSLATION_TIMEOUT_MS / 1000}s）。` +
+                    `本地引擎请先确认模型已下载（npm run fetch-model -- ${
+                        model || "Xenova/nllb-200-distilled-600M"
+                    }）；` +
+                    `Server API 请检查端点地址与 Key 是否可用。`,
+            );
+        }
+        throw new Error(
+            error?.response?.data?.error ?? error?.message ?? "翻译请求失败",
+        );
+    }
 
     const translations = Array.isArray(data?.translations)
         ? data.translations.map((t: unknown) => String(t ?? ""))
@@ -253,6 +302,24 @@ function ensureWorker(): Worker {
     return worker;
 }
 
+/**
+ * Drop the worker entirely (used when a job times out: the pipeline may still
+ * be stuck downloading, so the next run has to start from scratch).
+ */
+function killWorker() {
+    const worker = workerSingleton;
+    workerSingleton = null;
+    jobs.forEach((job) =>
+        job.reject(new Error("浏览器内翻译已取消（超时或重置）")),
+    );
+    jobs.clear();
+    try {
+        worker?.terminate();
+    } catch (e) {
+        // ignore
+    }
+}
+
 /** Run a 🤗 translation model inside the browser (Web Worker). */
 export function translateInBrowser(
     options: TranslateOptions & { quantized?: boolean },
@@ -262,7 +329,7 @@ export function translateInBrowser(
     const id = ++jobSeq;
     const idOrEmpty = model || "Xenova/nllb-200-distilled-600M";
 
-    return new Promise<string[]>((resolve, reject) => {
+    const job = new Promise<string[]>((resolve, reject) => {
         jobs.set(id, { resolve, reject });
         worker.postMessage({
             id,
@@ -277,11 +344,26 @@ export function translateInBrowser(
                 : undefined,
         });
     });
+
+    // The browser cannot reach huggingface.co through the system proxy, so an
+    // uncached model used to leave the promise pending forever.
+    return withTimeout(
+        job,
+        TRANSLATION_TIMEOUT_MS,
+        `浏览器内翻译超时（${
+            TRANSLATION_TIMEOUT_MS / 1000
+        }s）：模型 ${idOrEmpty} 可能未下载成功。` +
+            `浏览器直连 huggingface.co 常被网络/代理拦截，建议改用「本地引擎」并先执行 npm run fetch-model -- ${idOrEmpty}。`,
+        () => {
+            jobs.delete(id);
+            killWorker();
+        },
+    );
 }
 
 /** Drop the cached pipeline (e.g. after the model setting changed). */
 export function resetBrowserTranslator() {
-    workerSingleton?.postMessage({ type: "reset" });
+    killWorker();
 }
 
 /* ------------------------------------------------------------------ *

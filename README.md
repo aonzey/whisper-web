@@ -312,6 +312,9 @@ Settings 弹窗**左右并列两栏**：左边 `Transcription engine`，右边
 - 右栏的 **Prompt（补充要求）** 会作为「用户补充要求」追加进提示词，
   可用来固定术语、语气、人名处理等（只对 Server API 生效）。
 - 翻译期间按钮显示 `Translating... n/N`，进度条按句推进。
+- **每一步都有超时**：单次 `/api/translate` 请求 120s（`TRANSLATION_TIMEOUT_MS`），
+  服务端加载缺失权重 60s（`MODEL_DOWNLOAD_TIMEOUT_MS`）。超时会弹窗报错并让按钮复位，
+  不会再卡在 `Translating... 0%`。
 
 > 浏览器依然**不能直连**第三方端点（CORS + 不走系统代理），
 > Server API 的请求统一经本地服务端中转。
@@ -897,6 +900,13 @@ Git Bash 里 `pkill -f` 会匹配到**当前这条命令行本身**（因为里�
 
 - `local` 翻译引擎报「权重不在缓存目录」：
   `npm run fetch-model -- Xenova/opus-mt-en-zh`（脚本会按通用 ONNX 布局保存）。
+  huggingface.co 不可达时加 `--mirror https://hf-mirror.com/`。
+- **Bilingual 卡在 `Translating... 0%` / `Transcribing... 100%`**：
+  说明翻译这一步既没成功也没报错。两种成因都已修掉：
+  - 模型未缓存 → 联网下载既不成功也不失败，现已加超时（服务端加载 60s、
+    请求 120s），失败会给出「先执行 npm run fetch-model」的提示；
+  - 浏览器转写完成后触发翻译的 effect 会把自己的任务取消掉（已修）。
+  仍然卡住时，看服务端日志里有没有 `[translate] loading pipeline ...`。
 - NLLB / m2m100 / mBART 才需要 `src_lang` / `tgt_lang`，opus-mt 这类单语对模型
   不需要；代码已按模型名自动判断。
 - Server API 翻译返回 404：说明那个端点的 `/chat/completions` 不存在

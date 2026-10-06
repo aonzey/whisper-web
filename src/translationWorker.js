@@ -11,7 +11,11 @@
  */
 import { pipeline, env } from "@xenova/transformers";
 
-env.allowLocalModels = false;
+// Use the browser cache (IndexedDB) when the model is already there, and only
+// fall back to a download — the remote host is often unreachable from a
+// corporate network, so hitting the cache matters here.
+env.allowLocalModels = true;
+env.allowRemoteModels = true;
 
 let cached = { model: null, quantized: null, instance: null };
 

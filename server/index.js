@@ -119,6 +119,34 @@ const TRANSLATION_MODEL =
 const TRANSLATION_API_MODEL =
     process.env.TRANSLATION_API_MODEL || "gpt-4o-mini";
 const TRANSLATION_DEFAULT_TARGET = process.env.TRANSLATION_TARGET || "zh";
+/**
+ * Budget for one `/api/translate` (or bilingual) call. A 🤗 model that is not
+ * in the cache makes transformers.js download it from huggingface.co, which on
+ * a blocked network neither completes nor fails — the request used to hang
+ * forever and the UI sat at "Translating... 0%" with no way out.
+ */
+const TRANSLATION_TIMEOUT_MS = Number(
+    process.env.TRANSLATION_TIMEOUT_MS || 120000,
+);
+/**
+ * Same idea for loading a pipeline whose weights are missing: fail fast with an
+ * actionable message instead of waiting on an unreachable host.
+ */
+const MODEL_DOWNLOAD_TIMEOUT_MS = Number(
+    process.env.MODEL_DOWNLOAD_TIMEOUT_MS || 60000,
+);
+
+/** Reject instead of waiting forever. `onTimeout` can clean up pending state. */
+function withTimeout(promise, ms, message, onTimeout) {
+    let timer;
+    const guard = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            onTimeout?.();
+            reject(new Error(message));
+        }, ms);
+    });
+    return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
 
 // Node's global `fetch` ignores HTTP_PROXY/HTTPS_PROXY, so we install an
 // environment aware dispatcher when a proxy is configured.
@@ -703,14 +731,44 @@ async function runLocalTranslation({
     let pending = translationPipelines.get(key);
     if (!pending) {
         console.log(`[translate] loading pipeline ${model} (from ${cacheDir})`);
-        pending = pipeline("translation", model, {
+        const created = pipeline("translation", model, {
             quantized,
             cache_dir: cacheDir,
         });
+        // Weights are missing → transformers.js starts a download that may
+        // never finish (huggingface.co blocked). Cap it and say what to do.
+        const budget = weights.exists
+            ? TRANSLATION_TIMEOUT_MS
+            : MODEL_DOWNLOAD_TIMEOUT_MS;
+        pending = withTimeout(
+            created,
+            budget,
+            weights.exists
+                ? `加载翻译模型 ${model} 超时（${Math.round(budget / 1000)}s）。`
+                : `加载翻译模型 ${model} 超时（${Math.round(
+                      budget / 1000,
+                  )}s）：权重不在缓存目录 ${cacheDir}，且联网下载未完成。` +
+                      `请先执行：npm run fetch-model -- ${model}` +
+                      `（若 huggingface.co 不可达，加 --mirror https://hf-mirror.com/）`,
+            () => translationPipelines.delete(key),
+        );
         translationPipelines.set(key, pending);
         pending.catch(() => translationPipelines.delete(key));
     }
-    const translator = await pending;
+    let translator;
+    try {
+        translator = await pending;
+    } catch (error) {
+        if (!weights.exists) {
+            throw new Error(
+                `无法加载翻译模型 ${model}（${error?.message ?? error}）。` +
+                    `权重不在缓存目录 ${cacheDir}，请先执行：` +
+                    `npm run fetch-model -- ${model}` +
+                    `（huggingface.co 不可达时加 --mirror https://hf-mirror.com/）`,
+            );
+        }
+        throw error;
+    }
 
     const options = {};
     if (needsLanguageCodes(model)) {
@@ -1162,24 +1220,39 @@ async function translateHandler(req, res) {
             upstreamBase,
         );
 
-        const translations = await translateLines({
-            lines,
-            engine,
-            model: String(req.body?.model || ""),
-            sourceLanguage,
-            targetLanguage,
-            contextLines: Array.isArray(req.body?.context_lines)
-                ? req.body.context_lines
-                : [],
-            upstreamBase,
-            upstreamKey: String(
-                req.body?.upstream_api_key ||
-                    req.body?.translation_api_key ||
-                    "",
-            ).trim(),
-            upstreamModel: String(req.body?.upstream_model || "").trim(),
-            extraPrompt: extraPromptOf(req),
-        });
+        // Hard cap: an unreachable model host / upstream must not pin the
+        // request (and the UI progress bar) forever.
+        let translations;
+        try {
+            translations = await withTimeout(
+                translateLines({
+                    lines,
+                    engine,
+                    model: String(req.body?.model || ""),
+                    sourceLanguage,
+                    targetLanguage,
+                    contextLines: Array.isArray(req.body?.context_lines)
+                        ? req.body.context_lines
+                        : [],
+                    upstreamBase,
+                    upstreamKey: String(
+                        req.body?.upstream_api_key ||
+                            req.body?.translation_api_key ||
+                            "",
+                    ).trim(),
+                    upstreamModel: String(req.body?.upstream_model || "").trim(),
+                    extraPrompt: extraPromptOf(req),
+                }),
+                TRANSLATION_TIMEOUT_MS,
+                `翻译超时（${Math.round(
+                    TRANSLATION_TIMEOUT_MS / 1000,
+                )}s）。本地引擎请先用 npm run fetch-model 下载模型；Server API 请检查端点与 Key。`,
+            );
+        } catch (error) {
+            return res
+                .status(504)
+                .json({ error: error?.message ?? "翻译超时", engine });
+        }
 
         res.json({
             translations,

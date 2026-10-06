@@ -336,6 +336,12 @@ export function useTranscriber(): Transcriber {
     const bilingualRef = useRef(false);
     /** Does the job currently running belong to the "Bilingual" button? */
     const [bilingualRun, setBilingualRun] = useState(false);
+    /**
+     * The transcript object currently being translated by the effect below.
+     * Guards against the effect restarting (and previously cancelling) its own
+     * job when it flips `isBusy`.
+     */
+    const translatingRef = useRef<TranscriberData | undefined>(undefined);
 
     const setEngine = useCallback((value: Engine) => {
         saveSetting("engine", value);
@@ -496,6 +502,13 @@ export function useTranscriber(): Transcriber {
 
     // The in-browser (worker) pipeline reports completion through a worker
     // message, so its translation step is kicked off from here.
+    //
+    // `isBusy` is part of the dependency list and this effect flips it on, so
+    // the effect re-runs immediately. The cleanup used to set `cancelled`,
+    // which silently killed the very job it had just started: the transcript
+    // never got its translations and the button stayed busy forever
+    // ("Transcribing... 100%"). `translatingRef` makes the re-run a no-op
+    // instead of a cancellation.
     useEffect(() => {
         const output = transcript;
         if (!output || output.isBusy || isBusy) return;
@@ -504,40 +517,37 @@ export function useTranscriber(): Transcriber {
             bilingualRef.current = false;
             return;
         }
+        // Already translating this exact transcript — ignore the re-run.
+        if (translatingRef.current === output) return;
+        translatingRef.current = output;
 
-        let cancelled = false;
         setIsBusy(true);
         translateChunks(output.chunks)
             .then((chunks) => {
-                if (cancelled) return;
                 bilingualRef.current = false;
                 setTranscript({ ...output, chunks, bilingual: true });
             })
             .catch((error) => {
                 console.error("translation failed", error);
-                if (cancelled) return;
                 bilingualRef.current = false;
                 alert(
                     `翻译失败：${error?.message ?? error}\n\n` +
-                        `请检查 Settings → Translation engine（浏览器/本地引擎需要下载模型，Server API 需要可用端点与 Key）。`,
+                        `请检查 Settings → Translation engine（浏览器/本地引擎需要先下载模型，Server API 需要可用端点与 Key）。`,
                 );
                 // Mark the run as finished so the queue can advance.
                 setTranscript({ ...output, bilingual: true });
             })
             .finally(() => {
-                if (cancelled) return;
+                translatingRef.current = undefined;
                 setBilingualRun(false);
                 setIsBusy(false);
             });
-
-        return () => {
-            cancelled = true;
-        };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [transcript, isBusy, translateChunks]);
 
     const onInputChange = useCallback(() => {
         bilingualRef.current = false;
+        translatingRef.current = undefined;
         setBilingualRun(false);
         setTranscript(undefined);
     }, []);
