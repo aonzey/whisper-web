@@ -89,7 +89,162 @@ export const TRANSLATION_LANGUAGES = [
     { id: "ha", label: "Hausa", nllb: "hau_Latn" },
     { id: "yo", label: "Yoruba", nllb: "yor_Latn" },
     { id: "la", label: "Latin", nllb: "lat_Latn" },
+    // ---- m2m100 only (NLLB has no equivalent code in our table) ----
+    { id: "ast", label: "Asturian", nllb: "" },
+    { id: "ba", label: "Bashkir", nllb: "" },
+    { id: "br", label: "Breton", nllb: "" },
+    { id: "bs", label: "Bosnian", nllb: "" },
+    { id: "ceb", label: "Cebuano", nllb: "" },
+    { id: "cy", label: "Welsh", nllb: "" },
+    { id: "fy", label: "West Frisian", nllb: "" },
+    { id: "ga", label: "Irish", nllb: "" },
+    { id: "gd", label: "Scottish Gaelic", nllb: "" },
+    { id: "ht", label: "Haitian Creole", nllb: "" },
+    { id: "ig", label: "Igbo", nllb: "" },
+    { id: "ilo", label: "Ilocano", nllb: "" },
+    { id: "jv", label: "Javanese", nllb: "" },
+    { id: "lb", label: "Luxembourgish", nllb: "" },
+    { id: "lg", label: "Ganda", nllb: "" },
+    { id: "ln", label: "Lingala", nllb: "" },
+    { id: "mg", label: "Malagasy", nllb: "" },
+    { id: "ns", label: "Northern Sotho", nllb: "" },
+    { id: "oc", label: "Occitan", nllb: "" },
+    { id: "or", label: "Odia", nllb: "" },
+    { id: "ps", label: "Pashto", nllb: "" },
+    { id: "sd", label: "Sindhi", nllb: "" },
+    { id: "ss", label: "Swati", nllb: "" },
+    { id: "su", label: "Sundanese", nllb: "" },
+    { id: "tn", label: "Tswana", nllb: "" },
+    { id: "wo", label: "Wolof", nllb: "" },
+    { id: "xh", label: "Xhosa", nllb: "" },
+    { id: "yi", label: "Yiddish", nllb: "" },
+    { id: "zu", label: "Zulu", nllb: "" },
 ];
+
+/** True when the id must never be offered as a translation model. */
+export function isBrokenTranslationModel(id) {
+    return BROKEN_TRANSLATION_MODELS.includes(String(id ?? "").trim());
+}
+
+/**
+ * Weights that are known to be broken under transformers.js. They used to be
+ * offered as presets; now they are filtered out of every list (presets,
+ * cached weights, upstream models) so nobody can pick them by accident.
+ */
+export const BROKEN_TRANSLATION_MODELS = [
+    "Xenova/opus-mt-en-jap",
+    "Xenova/opus-mt-en-ko",
+    "Xenova/opus-mt-en-de",
+    "Xenova/opus-mt-en-fr",
+    "Xenova/opus-mt-en-es",
+    "Xenova/opus-mt-en-ru",
+];
+
+/** m2m100 does **not** understand NLLB codes like `zho_Hans` — it wants plain
+ * two letter codes (`zh`, `en`, `ja`). This maps our language ids onto the
+ * 100 codes m2m100_418M accepts; an id missing here is simply not supported.
+ */
+const M2M100_CODES = {
+    af: "af",
+    am: "am",
+    ar: "ar",
+    az: "az",
+    be: "be",
+    bg: "bg",
+    bn: "bn",
+    ca: "ca",
+    cs: "cs",
+    da: "da",
+    de: "de",
+    el: "el",
+    en: "en",
+    es: "es",
+    et: "et",
+    fa: "fa",
+    fi: "fi",
+    fr: "fr",
+    gl: "gl",
+    gu: "gu",
+    ha: "ha",
+    he: "he",
+    hi: "hi",
+    hr: "hr",
+    hu: "hu",
+    hy: "hy",
+    id: "id",
+    is: "is",
+    it: "it",
+    ja: "ja",
+    ka: "ka",
+    kk: "kk",
+    km: "km",
+    kn: "kn",
+    ko: "ko",
+    lo: "lo",
+    lt: "lt",
+    lv: "lv",
+    mk: "mk",
+    ml: "ml",
+    mn: "mn",
+    mr: "mr",
+    ms: "ms",
+    my: "my",
+    ne: "ne",
+    nl: "nl",
+    no: "no",
+    pa: "pa",
+    pl: "pl",
+    pt: "pt",
+    ro: "ro",
+    ru: "ru",
+    si: "si",
+    sk: "sk",
+    sl: "sl",
+    sq: "sq",
+    sr: "sr",
+    sv: "sv",
+    sw: "sw",
+    ta: "ta",
+    th: "th",
+    tl: "tl",
+    tr: "tr",
+    uk: "uk",
+    ur: "ur",
+    uz: "uz",
+    vi: "vi",
+    yo: "yo",
+    zh: "zh",
+    // m2m100 only -------------------------------------------------------
+    ast: "ast",
+    ba: "ba",
+    br: "br",
+    bs: "bs",
+    ceb: "ceb",
+    cy: "cy",
+    fy: "fy",
+    ga: "ga",
+    gd: "gd",
+    ht: "ht",
+    ig: "ig",
+    ilo: "ilo",
+    jv: "jv",
+    lb: "lb",
+    lg: "lg",
+    ln: "ln",
+    mg: "mg",
+    ns: "ns",
+    oc: "oc",
+    or: "or",
+    ps: "ps",
+    sd: "sd",
+    ss: "ss",
+    su: "su",
+    tn: "tn",
+    wo: "wo",
+    xh: "xh",
+    yi: "yi",
+    zu: "zu",
+};
 
 export function languageLabel(id) {
     if (!id) return "";
@@ -104,9 +259,128 @@ export function nllbCode(id) {
     return TRANSLATION_LANGUAGES.find((l) => l.id === id)?.nllb ?? "";
 }
 
-/** Only NLLB / m2m100 / mBART accept `src_lang` / `tgt_lang`. */
+/** m2m100 style code for a language id (`zh` -> `zh`). "" when unsupported. */
+export function m2mCode(id) {
+    if (!id) return "";
+    return M2M100_CODES[String(id)] ?? "";
+}
+
+/**
+ * Which `src_lang` / `tgt_lang` dialect a model expects:
+ *   - "nllb"    -> `zho_Hans`, `eng_Latn`, ... (NLLB)
+ *   - "m2m100"  -> `zh`, `en`, ... (m2m100)
+ *   - "none"    -> the model has a hard wired direction (opus-mt-*), passing
+ *                  any language code makes it fail.
+ */
+export function modelCodeStyle(model) {
+    const id = String(model ?? "").toLowerCase();
+    if (!id) return "none";
+    if (id.includes("nllb")) return "nllb";
+    if (id.includes("m2m100") || id.includes("m2m_100")) return "m2m100";
+    return "none";
+}
+
+/** Fallback code when the caller did not pick a language. */
+export function defaultLanguageCode(model, role) {
+    const style = modelCodeStyle(model);
+    if (style === "m2m100") return role === "source" ? "en" : "zh";
+    if (style === "nllb") return role === "source" ? "eng_Latn" : "zho_Hans";
+    return "";
+}
+
+/**
+ * The `src_lang` / `tgt_lang` value to pass for `model`.
+ * Returns "" when the model takes no language code at all (opus-mt-*), or when
+ * the language is unknown to that model family — the caller must then either
+ * leave it out or report the mismatch.
+ */
+export function languageCodeFor(model, id) {
+    const style = modelCodeStyle(model);
+    if (style === "none") return "";
+    return style === "m2m100" ? m2mCode(id) : nllbCode(id);
+}
+
+/** Language ids `model` can translate into ("" for opus-mt-* style guesses). */
+export function supportedTargetIds(model) {
+    return targetLanguagesForModel(model).map((language) => language.id);
+}
+
+/**
+ * `opus-mt-en-zh` only does English → Chinese, so its target list is a single
+ * language. Returns null for models with no fixed direction.
+ */
+export function fixedPairLanguages(model) {
+    const name = String(model ?? "").split("/").pop() ?? "";
+    if (!/opus|marian/i.test(name)) return null;
+
+    const tokens = name.toLowerCase().split(/[-_.]+/).filter(Boolean);
+    if (tokens.length < 3) return null;
+    const [, srcRaw, tgtRaw] = tokens.slice(-3);
+    const normalize = (code) =>
+        OPUS_CODE_ALIASES[code] ??
+        (TRANSLATION_LANGUAGES.some((language) => language.id === code)
+            ? code
+            : "");
+    const src = normalize(srcRaw);
+    const tgt = normalize(tgtRaw);
+    if (!src || !tgt) return null;
+    return { src, tgt };
+}
+
+/** Marian / opus-mt use a mix of ISO 639-1 and 639-3 codes. */
+const OPUS_CODE_ALIASES = {
+    cmn: "zh",
+    zho: "zh",
+    chi: "zh",
+    jpn: "ja",
+    jap: "ja",
+    kor: "ko",
+    deu: "de",
+    ger: "de",
+    fra: "fr",
+    fre: "fr",
+    spa: "es",
+    rus: "ru",
+    por: "pt",
+    nld: "nl",
+    dut: "nl",
+    ita: "it",
+    ara: "ar",
+    arb: "ar",
+    eng: "en",
+};
+
+/**
+ * Options for the "Translate subtitles into" dropdown: they depend on the
+ * selected model (nllb 200 codes / m2m100 100 codes / one fixed language for
+ * opus-mt-*). LLM ("api") engines take any language name.
+ */
+export function targetLanguagesForModel(model, engine) {
+    if (!model || String(engine ?? "").toLowerCase() === "api") {
+        return TRANSLATION_LANGUAGES;
+    }
+
+    const fixed = fixedPairLanguages(model);
+    if (fixed) {
+        return TRANSLATION_LANGUAGES.filter(
+            (language) => language.id === fixed.tgt,
+        );
+    }
+
+    const style = modelCodeStyle(model);
+    if (style === "nllb") {
+        return TRANSLATION_LANGUAGES.filter((language) => !!language.nllb);
+    }
+    if (style === "m2m100") {
+        return TRANSLATION_LANGUAGES.filter((language) => !!m2mCode(language.id));
+    }
+    // Unknown model: do not restrict anything.
+    return TRANSLATION_LANGUAGES;
+}
+
+/** Only NLLB / m2m100 accept `src_lang` / `tgt_lang`. */
 export function needsLanguageCodes(model) {
-    return /nllb|m2m100|mbart/i.test(model ?? "");
+    return modelCodeStyle(model) !== "none";
 }
 
 /**

@@ -912,10 +912,29 @@ Git Bash 里 `pkill -f` 会匹配到**当前这条命令行本身**（因为里�
     请求 120s），失败会给出「先执行 npm run fetch-model」的提示；
   - 浏览器转写完成后触发翻译的 effect 会把自己的任务取消掉（已修）。
   仍然卡住时，看服务端日志里有没有 `[translate] loading pipeline ...`。
-- NLLB / m2m100 / mBART 才需要 `src_lang` / `tgt_lang`，opus-mt 这类单语对模型
-  不需要；代码已按模型名自动判断。
+- **语言码按模型自动切换**（`src/utils/TranslationFormats.js`）：
+  - NLLB → `zho_Hans` / `eng_Latn`（Settings 里目标语言下拉只列 NLLB 支持的 73 种）；
+  - m2m100 → `zh` / `en` / `ja` 这类**两字母码**（下拉自动切成 m2m100 的 98 种，
+    不再出现 `zh-Hant`、`te` 等它不支持的项）；
+  - `opus-mt-*` 这类固定方向模型**不传**语言码，下拉只剩它的目标语言；
+  - Server API（LLM）不限制语言。
+  切换模型时若当前目标语言不被支持，会自动改成该模型的默认语言，避免跑到一半才报错。
 - Server API 翻译返回 404：说明那个端点的 `/chat/completions` 不存在
   （只有 `/audio/transcriptions` 的 ASR 端点不能用来翻译）。
+
+**C9. 报 `Target language code "zho_Hans" is not valid. Must be one of: {af, am, ...}`**
+
+m2m100 系列（如 `Xenova/m2m100_418M`）**不认识 NLLB 的 `zho_Hans` 语言码**，
+它只接受 `zh` / `en` / `ja` 这样的两字母码。现在语言码由模型名决定（见上一条），
+目标语言下拉也只列出该模型真正支持的语言，选了不支持的语言会直接给出
+「可用的目标语言：…」的提示而不是让 tokenizer 抛错。
+
+**C10. Translation model 下拉里的 `Xenova/opus-mt-en-jap|ko|de|fr|es|ru` 去哪了**
+
+已全部移除：这几个权重在 transformers.js 下要么解码不出内容、要么实测不可用，
+与其让用户选中后卡死，不如不提供（服务端 `/api/models` 也会过滤掉它们，
+即使本地恰好缓存过）。日语/韩语/德语等请直接用 `Xenova/nllb-200-distilled-600M`
+或 `Xenova/m2m100_418M`。
 
 **C8. Browser（浏览器）引擎报 `Unexpected token '<', "<!DOCTYPE " ... is not valid JSON`**
 

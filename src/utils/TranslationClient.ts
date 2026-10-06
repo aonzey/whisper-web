@@ -6,10 +6,17 @@ import {
     TRANSLATION_CONTEXT_SIZE,
     TRANSLATION_LANGUAGES,
     buildTranslationPrompt,
+    defaultLanguageCode,
+    fixedPairLanguages,
+    isBrokenTranslationModel,
+    languageCodeFor,
     languageLabel,
+    modelCodeStyle,
     nllbCode,
     needsLanguageCodes,
     parseNumberedTranslations,
+    supportedTargetIds,
+    targetLanguagesForModel,
 } from "./TranslationFormats.js";
 
 /**
@@ -29,10 +36,17 @@ export {
     TRANSLATION_CONTEXT_SIZE,
     TRANSLATION_LANGUAGES,
     buildTranslationPrompt,
+    defaultLanguageCode,
+    fixedPairLanguages,
+    isBrokenTranslationModel,
+    languageCodeFor,
     languageLabel,
+    modelCodeStyle,
     nllbCode,
     needsLanguageCodes,
     parseNumberedTranslations,
+    supportedTargetIds,
+    targetLanguagesForModel,
 };
 
 /** Model presets for the browser / local (🤗 Transformers.js) engines. */
@@ -65,42 +79,6 @@ export const TRANSLATION_MODELS: TranslationModelOption[] = [
     {
         id: "Xenova/opus-mt-en-zh",
         note: "仅 English → Chinese",
-        multilingual: false,
-        size: "≈80MB",
-    },
-    {
-        id: "Xenova/opus-mt-en-jap",
-        note: "仅 English → Japanese（该 ONNX 在 transformers.js 下输出为空，日语请用 nllb）",
-        multilingual: false,
-        size: "≈80MB",
-    },
-    {
-        id: "Xenova/opus-mt-en-ko",
-        note: "仅 English → Korean",
-        multilingual: false,
-        size: "≈80MB",
-    },
-    {
-        id: "Xenova/opus-mt-en-de",
-        note: "仅 English → German",
-        multilingual: false,
-        size: "≈80MB",
-    },
-    {
-        id: "Xenova/opus-mt-en-fr",
-        note: "仅 English → French",
-        multilingual: false,
-        size: "≈80MB",
-    },
-    {
-        id: "Xenova/opus-mt-en-es",
-        note: "仅 English → Spanish",
-        multilingual: false,
-        size: "≈80MB",
-    },
-    {
-        id: "Xenova/opus-mt-en-ru",
-        note: "仅 English → Russian",
         multilingual: false,
         size: "≈80MB",
     },
@@ -191,12 +169,19 @@ export async function translateViaServer(
     } = options;
 
     const target = classifyApiBase(baseUrl || "");
+    const resolvedModel = model || "Xenova/nllb-200-distilled-600M";
+    // nllb wants `zho_Hans`, m2m100 wants `zh`, opus-mt-* wants nothing.
+    const targetCode = languageCodeFor(resolvedModel, targetLanguage);
     const payload: Record<string, unknown> = {
         engine,
         lines,
         target_language: targetLanguage,
-        target_language_code: nllbCode(targetLanguage),
+        target_language_code: targetCode,
         source_language: sourceLanguage || "",
+        source_language_code: languageCodeFor(
+            resolvedModel,
+            sourceLanguage || "",
+        ),
     };
     if (model) payload.model = model;
     if (prompt && String(prompt).trim()) {
@@ -329,6 +314,29 @@ export function translateInBrowser(
     const id = ++jobSeq;
     const idOrEmpty = model || "Xenova/nllb-200-distilled-600M";
 
+    // nllb / m2m100 need explicit codes, opus-mt-* must not get any.
+    const wantsCodes = needsLanguageCodes(idOrEmpty);
+    const srcLang = wantsCodes
+        ? languageCodeFor(idOrEmpty, sourceLanguage || "") ||
+          defaultLanguageCode(idOrEmpty, "source")
+        : undefined;
+    const tgtLang = wantsCodes
+        ? languageCodeFor(idOrEmpty, targetLanguage) ||
+          defaultLanguageCode(idOrEmpty, "target")
+        : undefined;
+    if (wantsCodes && !languageCodeFor(idOrEmpty, targetLanguage)) {
+        const fixed = fixedPairLanguages(idOrEmpty);
+        if (!fixed) {
+            throw new Error(
+                `模型 ${idOrEmpty} 不支持目标语言「${languageLabel(
+                    targetLanguage,
+                )}」。该模型可用的目标语言：${supportedTargetIds(idOrEmpty)
+                    .map((code) => languageLabel(code))
+                    .join("、")}`,
+            );
+        }
+    }
+
     const job = new Promise<string[]>((resolve, reject) => {
         jobs.set(id, { resolve, reject });
         worker.postMessage({
@@ -336,12 +344,8 @@ export function translateInBrowser(
             model: idOrEmpty,
             quantized: quantized !== false,
             lines,
-            srcLang: needsLanguageCodes(idOrEmpty)
-                ? nllbCode(sourceLanguage || "") || "eng_Latn"
-                : undefined,
-            tgtLang: needsLanguageCodes(idOrEmpty)
-                ? nllbCode(targetLanguage) || "zho_Hans"
-                : undefined,
+            srcLang,
+            tgtLang,
         });
     });
 

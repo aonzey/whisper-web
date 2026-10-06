@@ -511,8 +511,14 @@ async function main() {
 
     // Final folder: Whisper layout → "Transcription models", anything else
     // (opus-mt / nllb / generic ONNX) → "Translation models".
+    // `guessCategory` wins: m2m100 / mBART also ship `encoder_model` +
+    // `decoder_model_merged` ONNX files, so the layout alone cannot tell
+    // them apart from a Whisper export.
     if (!typeArg) {
-        category = isWhisperLayout ? "asr" : "translation";
+        category =
+            category === "translation" || !isWhisperLayout
+                ? "translation"
+                : "asr";
         CACHE_DIR = dirFor(category);
     }
     console.log(`folder  : ${path.join(CACHE_DIR, modelId)}  [${category}]`);

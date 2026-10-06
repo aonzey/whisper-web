@@ -48,10 +48,15 @@ import {
     TRANSLATION_BATCH_SIZE,
     TRANSLATION_CONTEXT_SIZE,
     buildTranslationPrompt,
+    defaultLanguageCode,
+    fixedPairLanguages,
+    isBrokenTranslationModel,
+    languageCodeFor,
     languageLabel,
     needsLanguageCodes,
     nllbCode,
     parseNumberedTranslations,
+    supportedTargetIds,
 } from "../src/utils/TranslationFormats.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -860,11 +865,35 @@ async function runLocalTranslation({
     }
     if (weights.exists && !weights.quantized) quantized = false;
 
+    // nllb wants `zho_Hans`, m2m100 wants `zh`, opus-mt-* wants no code at all.
     const options = {};
     if (needsLanguageCodes(model)) {
-        options.src_lang = nllbCode(sourceLanguage) || "eng_Latn";
-        options.tgt_lang =
-            nllbCode(targetLanguage) || nllbCode("zh") || "zho_Hans";
+        const targetCode = languageCodeFor(model, targetLanguage);
+        if (!targetCode) {
+            throw new Error(
+                `模型 ${model} 不支持目标语言「${languageLabel(
+                    targetLanguage,
+                )}」（${targetLanguage}）。` +
+                    `可用的目标语言：${supportedTargetIds(model).join("、")}`,
+            );
+        }
+        options.src_lang =
+            languageCodeFor(model, sourceLanguage) ||
+            defaultLanguageCode(model, "source");
+        options.tgt_lang = targetCode;
+    } else {
+        // A fixed direction model (opus-mt-*) silently produces garbage when
+        // asked for another language, so refuse right away.
+        const pair = fixedPairLanguages(model);
+        if (pair && pair.tgt !== targetLanguage) {
+            throw new Error(
+                `${model} 只支持 ${languageLabel(pair.src)} → ${languageLabel(
+                    pair.tgt,
+                )}（${pair.tgt}），当前目标语言是「${languageLabel(
+                    targetLanguage,
+                )}」。请改用 nllb / m2m100 等多语言模型。`,
+            );
+        }
     }
 
     const text = lines.map((line) => String(line ?? "").trim());
@@ -1537,7 +1566,11 @@ app.get("/api/models", requireToken, (req, res) => {
     // "asr" (transcription column) / "translation" (translation column) /
     // "" (everything). Lets each Settings column list only its own models.
     const taskFilter = String(req.query?.task ?? "").toLowerCase();
-    const cached = filterByTask(listLocalModels(), taskFilter);
+    const cached = filterByTask(listLocalModels(), taskFilter).filter(
+        // Weights that decode nothing under transformers.js must not show up
+        // in the dropdown, even when they happen to be on disk.
+        (id) => !isBrokenTranslationModel(id),
+    );
     const cachedSet = new Set(listLocalModels());
 
     // Rich per-model info so the UI can mark which ones are actually usable.

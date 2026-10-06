@@ -12,9 +12,14 @@ import { formatAudioTimestamp } from "../utils/AudioUtils";
 import { exportAll } from "../utils/ExportUtils";
 import {
     TRANSLATION_API_MODELS,
-    TRANSLATION_LANGUAGES,
     TRANSLATION_MODELS,
     TranslationEngine,
+    fixedPairLanguages,
+    isBrokenTranslationModel,
+    languageCodeFor,
+    languageLabel,
+    modelCodeStyle,
+    targetLanguagesForModel,
 } from "../utils/TranslationClient";
 import {
     checkApiHealth,
@@ -1158,6 +1163,7 @@ function SettingsModal(props: {
     // (only meaningful for a third party endpoint), then the built-in presets.
     const cachedTranslationModels = mtModels
         .filter((option) => option.cached)
+        .filter((option) => !isBrokenTranslationModel(option.id))
         .map((option) => ({
             id: option.id,
             // The chat endpoint cannot run 🤗 weights — say so instead of
@@ -1173,6 +1179,7 @@ function SettingsModal(props: {
         translationApiTarget.kind === "openai"
             ? mtModels
                   .filter((option) => !option.cached)
+                  .filter((option) => !isBrokenTranslationModel(option.id))
                   .map((option) => ({
                       id: option.id,
                       note: "上游聊天模型",
@@ -1209,6 +1216,43 @@ function SettingsModal(props: {
     const translationModelInList = translationModelList.includes(
         currentTranslationModel,
     );
+
+    // Which languages the selected model can actually produce. nllb wants
+    // `zho_Hans` style codes, m2m100 plain `zh`, opus-mt-* a single language.
+    const targetLanguageOptions = targetLanguagesForModel(
+        currentTranslationModel,
+        translationEngine,
+    );
+    const targetLanguageSupported = targetLanguageOptions.some(
+        (language) => language.id === props.transcriber.translationTarget,
+    );
+    const fixedPair = fixedPairLanguages(currentTranslationModel);
+    const codeStyle = modelCodeStyle(currentTranslationModel);
+    const resolvedTargetCode = languageCodeFor(
+        currentTranslationModel,
+        props.transcriber.translationTarget,
+    );
+
+    /**
+     * Switch model **and** keep the target language valid: a model that cannot
+     * produce it would only fail later with a cryptic token error.
+     */
+    const applyTranslationModel = (value: string) => {
+        setCurrentTranslationModelValue(value);
+        const options = targetLanguagesForModel(value, translationEngine);
+        if (
+            options.length &&
+            !options.some(
+                (language) =>
+                    language.id === props.transcriber.translationTarget,
+            )
+        ) {
+            const fallback = options.find((language) => language.id === "zh");
+            props.transcriber.setTranslationTarget(
+                (fallback ?? options[0]).id,
+            );
+        }
+    };
 
     return (
         <Modal
@@ -1613,24 +1657,46 @@ function SettingsModal(props: {
                                 )
                             }
                         >
-                            {!TRANSLATION_LANGUAGES.some(
-                                (l) =>
-                                    l.id ===
-                                    props.transcriber.translationTarget,
-                            ) && (
+                            {!targetLanguageSupported && (
                                 <option
                                     value={props.transcriber.translationTarget}
                                 >
-                                    {props.transcriber.translationTarget ||
-                                        "(未选择)"}
+                                    {languageLabel(
+                                        props.transcriber.translationTarget,
+                                    ) || "(未选择)"}
+                                    {" — 当前模型不支持"}
                                 </option>
                             )}
-                            {TRANSLATION_LANGUAGES.map((language) => (
+                            {targetLanguageOptions.map((language) => (
                                 <option key={language.id} value={language.id}>
                                     {language.label}
+                                    {language.id !==
+                                        props.transcriber.translationTarget &&
+                                    codeStyle !== "none"
+                                        ? ` (${
+                                              codeStyle === "m2m100"
+                                                  ? language.id
+                                                  : language.nllb
+                                          })`
+                                        : ""}
                                 </option>
                             ))}
                         </select>
+                        <p className='text-xs text-slate-400 mb-2'>
+                            {translationEngine === "api"
+                                ? "LLM 引擎：任意语言都可以（直接把语言名写进提示词）。"
+                                : fixedPair
+                                ? `固定方向模型：只能译成 ${languageLabel(
+                                      fixedPair.tgt,
+                                  )}（${languageLabel(
+                                      fixedPair.src,
+                                  )} → ${languageLabel(fixedPair.tgt)}）。`
+                                : codeStyle === "m2m100"
+                                ? "该模型使用 m2m100 语言码（zh / en / ja …，共约 100 种），已按此过滤。"
+                                : codeStyle === "nllb"
+                                ? `该模型使用 NLLB 语言码，当前目标为 ${resolvedTargetCode}。`
+                                : "未知模型：未做语言限制。"}
+                        </p>
 
                         <div className='flex items-center justify-between'>
                             <label>
@@ -1668,9 +1734,7 @@ function SettingsModal(props: {
                                 className={inputClass}
                                 value={currentTranslationModel}
                                 onChange={(e) =>
-                                    setCurrentTranslationModelValue(
-                                        e.target.value,
-                                    )
+                                    applyTranslationModel(e.target.value)
                                 }
                             />
                         ) : (
@@ -1678,9 +1742,7 @@ function SettingsModal(props: {
                                 className={selectClass}
                                 value={currentTranslationModel}
                                 onChange={(e) =>
-                                    setCurrentTranslationModelValue(
-                                        e.target.value,
-                                    )
+                                    applyTranslationModel(e.target.value)
                                 }
                             >
                                 {!translationModelInList && (
