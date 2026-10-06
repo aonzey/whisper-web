@@ -70,7 +70,7 @@ export const TRANSLATION_MODELS: TranslationModelOption[] = [
     },
     {
         id: "Xenova/opus-mt-en-jap",
-        note: "仅 English → Japanese",
+        note: "仅 English → Japanese（该 ONNX 在 transformers.js 下输出为空，日语请用 nllb）",
         multilingual: false,
         size: "≈80MB",
     },

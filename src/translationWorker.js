@@ -43,6 +43,18 @@ async function getTranslator(model, quantized, onProgress) {
     return instance;
 }
 
+/**
+ * Upper bound for the generated sequence.
+ *
+ * Some ONNX exports never emit EOS and keep decoding until `max_length`
+ * (512), which costs ~100s of CPU per sentence. Scaling the budget to the
+ * input keeps real translations intact while capping the pathological case.
+ */
+function maxNewTokensFor(lines) {
+    const longest = lines.reduce((n, line) => Math.max(n, line.length), 8);
+    return Math.min(256, Math.max(48, Math.ceil(longest * 0.8) + 16));
+}
+
 self.addEventListener("message", async (event) => {
     const message = event.data ?? {};
 
@@ -73,14 +85,34 @@ self.addEventListener("message", async (event) => {
         if (srcLang) options.src_lang = srcLang;
         if (tgtLang) options.tgt_lang = tgtLang;
 
-        const output = await translator(
-            (lines ?? []).map((line) => String(line ?? "").trim()),
-            options,
-        );
+        const text = (lines ?? []).map((line) => String(line ?? "").trim());
+        const output = await translator(text, {
+            ...options,
+            max_new_tokens: maxNewTokensFor(text),
+        });
 
         const translations = (Array.isArray(output) ? output : [output]).map(
             (item) => item?.translation_text ?? "",
         );
+
+        // Some ONNX exports decode nothing but <pad>. Say so instead of
+        // filling the transcript with empty lines.
+        if (
+            text.some((line) => line.length > 0) &&
+            translations.every((item) => !item)
+        ) {
+            self.postMessage({
+                status: "error",
+                id,
+                message:
+                    `模型 ${model} 解码结果为空（只生成 <pad> token），` +
+                    `该 ONNX 权重在当前引擎下不可用。` +
+                    `建议改用 Xenova/nllb-200-distilled-600M，` +
+                    `或把 Translation engine 切到 Server API。`,
+            });
+            return;
+        }
+
         self.postMessage({ status: "complete", id, translations });
     } catch (error) {
         self.postMessage({

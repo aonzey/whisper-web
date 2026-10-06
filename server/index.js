@@ -34,7 +34,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
+import { execFile, fork } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import multer from "multer";
@@ -679,7 +679,127 @@ function runCommand({ file, model, language, task }) {
  *   "openai" -> OpenAI compatible /chat/completions (context aware LLM)
  * ------------------------------------------------------------------ */
 
-const translationPipelines = new Map();
+/* ------------------------------------------------------------------ *
+ * Local translation runs inside a forked child process.
+ *
+ * ONNX Runtime executes synchronously: one non-converging generation
+ * (some exports never emit EOS and keep decoding up to `max_length`)
+ * pins a CPU core and blocks the whole event loop — every other request
+ * queues up and even reloading the page looks frozen. A `withTimeout`
+ * around the promise cannot cancel native code, so the only reliable
+ * escape hatch is `SIGKILL` on a separate process.
+ * ------------------------------------------------------------------ */
+
+const MT_WORKER_PATH = fileURLToPath(
+    new URL("./translation-worker.mjs", import.meta.url),
+);
+/** @type {import("node:child_process").ChildProcess | null} */
+let mtChild = null;
+const mtJobs = new Map();
+let mtSeq = 0;
+
+function killMtChild() {
+    if (!mtChild) return;
+    try {
+        mtChild.kill("SIGKILL");
+    } catch (e) {
+        /* already gone */
+    }
+    mtChild = null;
+}
+
+function failAllMtJobs(error) {
+    for (const job of mtJobs.values()) {
+        clearTimeout(job.timer);
+        job.reject(error);
+    }
+    mtJobs.clear();
+}
+
+function ensureMtChild() {
+    if (mtChild && mtChild.connected) return mtChild;
+    // The child prints a lot of ONNX Runtime warnings; keep them out of the
+    // server's own output unless explicitly asked for.
+    const verbose = process.env.MT_WORKER_VERBOSE === "1";
+    const child = fork(MT_WORKER_PATH, [], {
+        stdio: [
+            "ignore",
+            verbose ? "inherit" : "ignore",
+            verbose ? "inherit" : "ignore",
+            "ipc",
+        ],
+    });
+    child.on("message", (message) => {
+        if (!message || message.ready) return;
+        const job = mtJobs.get(message.id);
+        if (!job) return;
+        mtJobs.delete(message.id);
+        clearTimeout(job.timer);
+        if (message.ok) {
+            job.resolve(message.translations);
+        } else {
+            const error = new Error(
+                message.message || "本地翻译子进程返回失败",
+            );
+            error.degraded = Boolean(message.degraded);
+            job.reject(error);
+        }
+    });
+    child.on("error", (error) => {
+        mtChild = null;
+        failAllMtJobs(error);
+    });
+    child.on("exit", () => {
+        mtChild = null;
+        failAllMtJobs(new Error("翻译子进程意外退出（可能被系统终止）"));
+    });
+    mtChild = child;
+    return child;
+}
+
+/**
+ * Send one batch to the translation child and wait for it.
+ * On timeout the child is killed outright — that is the whole point.
+ */
+async function runTranslationInChild(payload, timeoutMs) {
+    const child = ensureMtChild();
+    const id = ++mtSeq;
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            mtJobs.delete(id);
+            killMtChild();
+            reject(
+                new Error(
+                    `本地翻译超时（${Math.round(
+                        timeoutMs / 1000,
+                    )}s），已终止翻译进程释放 CPU。` +
+                        `常见原因：模型权重未缓存而联网下载卡住、句子过长，` +
+                        `或该 ONNX 模型解码不收敛。` +
+                        `建议改用 Xenova/nllb-200-distilled-600M，或把 ` +
+                        `Translation engine 切到 Server API。`,
+                ),
+            );
+        }, timeoutMs);
+        mtJobs.set(id, { resolve, reject, timer });
+        child.send({ ...payload, id });
+    });
+}
+
+// Never leave the child behind when the server stops.
+process.on("exit", killMtChild);
+// A rejected translation promise must never take the whole server down.
+process.on("uncaughtException", (error) => {
+    console.error("[fatal] uncaught exception:", error);
+});
+process.on("unhandledRejection", (error) => {
+    console.error("[fatal] unhandled rejection:", error);
+});
+for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, () => {
+        killMtChild();
+        process.exit(0);
+    });
+}
 
 /** Does the cache hold usable weights for a generic (non whisper) model? */
 function inspectGenericModel(model) {
@@ -705,19 +825,13 @@ async function runLocalTranslation({
     targetLanguage,
     quantized,
 }) {
-    const { pipeline, env } = await import("@xenova/transformers");
-    env.allowLocalModels = true;
-    env.useFSCache = true;
-    env.cacheDir = CACHE_ROOT; // fallback for the legacy flat layout
     const cacheDir = resolveModelDir(model, "translation").root;
-    env.remoteHost = HF_ENDPOINT;
 
     const weights = inspectGenericModel(model);
     const offline =
         LOCAL_OFFLINE === "1" ||
         LOCAL_OFFLINE === "true" ||
         (LOCAL_OFFLINE === "auto" && weights.exists);
-    env.allowRemoteModels = !offline;
 
     if (!weights.exists && offline) {
         throw new Error(
@@ -727,37 +841,32 @@ async function runLocalTranslation({
     }
     if (weights.exists && !weights.quantized) quantized = false;
 
-    const key = `${model}|${quantized}`;
-    let pending = translationPipelines.get(key);
-    if (!pending) {
-        console.log(`[translate] loading pipeline ${model} (from ${cacheDir})`);
-        const created = pipeline("translation", model, {
-            quantized,
-            cache_dir: cacheDir,
-        });
-        // Weights are missing → transformers.js starts a download that may
-        // never finish (huggingface.co blocked). Cap it and say what to do.
-        const budget = weights.exists
-            ? TRANSLATION_TIMEOUT_MS
-            : MODEL_DOWNLOAD_TIMEOUT_MS;
-        pending = withTimeout(
-            created,
-            budget,
-            weights.exists
-                ? `加载翻译模型 ${model} 超时（${Math.round(budget / 1000)}s）。`
-                : `加载翻译模型 ${model} 超时（${Math.round(
-                      budget / 1000,
-                  )}s）：权重不在缓存目录 ${cacheDir}，且联网下载未完成。` +
-                      `请先执行：npm run fetch-model -- ${model}` +
-                      `（若 huggingface.co 不可达，加 --mirror https://hf-mirror.com/）`,
-            () => translationPipelines.delete(key),
-        );
-        translationPipelines.set(key, pending);
-        pending.catch(() => translationPipelines.delete(key));
+    const options = {};
+    if (needsLanguageCodes(model)) {
+        options.src_lang = nllbCode(sourceLanguage) || "eng_Latn";
+        options.tgt_lang =
+            nllbCode(targetLanguage) || nllbCode("zh") || "zho_Hans";
     }
-    let translator;
+
+    const text = lines.map((line) => String(line ?? "").trim());
+    // A batch of 10 long sentences needs more than a single sentence, but a
+    // missing-weights download must fail fast instead.
+    const timeout = weights.exists
+        ? Math.max(TRANSLATION_TIMEOUT_MS, text.length * 20000)
+        : MODEL_DOWNLOAD_TIMEOUT_MS;
+
     try {
-        translator = await pending;
+        return await runTranslationInChild(
+            {
+                model,
+                quantized,
+                cacheDir,
+                allowRemote: !offline,
+                lines: text,
+                options,
+            },
+            timeout,
+        );
     } catch (error) {
         if (!weights.exists) {
             throw new Error(
@@ -769,20 +878,6 @@ async function runLocalTranslation({
         }
         throw error;
     }
-
-    const options = {};
-    if (needsLanguageCodes(model)) {
-        options.src_lang = nllbCode(sourceLanguage) || "eng_Latn";
-        options.tgt_lang = nllbCode(targetLanguage) || nllbCode("zh") || "zho_Hans";
-    }
-
-    const output = await translator(
-        lines.map((line) => String(line ?? "").trim()),
-        options,
-    );
-    return (Array.isArray(output) ? output : [output]).map(
-        (item) => item?.translation_text ?? "",
-    );
 }
 
 /** Call an OpenAI compatible chat endpoint and parse the numbered reply. */

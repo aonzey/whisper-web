@@ -912,6 +912,26 @@ Git Bash 里 `pkill -f` 会匹配到**当前这条命令行本身**（因为里�
 - Server API 翻译返回 404：说明那个端点的 `/chat/completions` 不存在
   （只有 `/audio/transcriptions` 的 ASR 端点不能用来翻译）。
 
+**C7. 某个模型一直「在翻译」、CPU 打满，刷新页面也没用**
+
+这是 ONNX Runtime 的特性：推理是同步执行的，一句不收敛的生成会占满 CPU
+并**阻塞整个 Node 事件循环**——其他请求全部排队，前端刷新也就"没反应"。
+（用 JS 的 `Promise.race` 超时取消不掉 native 代码里的循环。）
+
+现在本地翻译跑在**独立子进程**（`server/translation-worker.mjs`）里：
+
+- 超时后父进程 `SIGKILL` 子进程，CPU 立刻释放，主服务始终可响应；
+- 生成长度按输入长度封顶（`max_new_tokens` ≤ 256），避免解码到 `max_length=512`；
+- 每个模型首次使用时做一次单句探针，几秒内就能发现"只生成 `<pad>`"的坏权重。
+
+要看子进程自己的日志（模型加载、探针过程）时用 `MT_WORKER_VERBOSE=1 npm run server`。
+
+已知案例：`Xenova/opus-mt-en-jap` 在 transformers.js 下**量化与非量化权重都
+只生成 `<pad>` token**（实测 96s/句且输出为空），属于 ONNX 导出本身的问题，
+应用层无法修复。日语请改用 `Xenova/nllb-200-distilled-600M`
+（`tgt_lang=jpn_Jpan`，实测 20 句 ≈1 分钟），或把 Translation engine 切到
+Server API。
+
 ### D. 浏览器与前端
 
 **D1. 浏览器模型缓存按 origin 隔离**
