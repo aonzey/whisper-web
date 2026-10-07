@@ -32,6 +32,11 @@ function activeChunkIndex(
     return -1;
 }
 
+const exportButtonClass =
+    "text-white bg-green-500 hover:bg-green-600 focus:ring-4 focus:ring-green-300 font-medium rounded-lg text-sm px-4 py-2 text-center mr-2 dark:bg-green-600 dark:hover:bg-green-700 dark:focus:ring-green-800 inline-flex items-center";
+const exportButtonDisabledClass =
+    "text-white bg-gray-300 cursor-not-allowed font-medium rounded-lg text-sm px-4 py-2 text-center mr-2 inline-flex items-center";
+
 export default function Transcript({
     transcribedData,
     fileName,
@@ -42,13 +47,21 @@ export default function Transcript({
     const itemRefs = useRef<(HTMLDivElement | null)[]>([]);
 
     const chunks = transcribedData?.chunks ?? [];
-    const bilingual = Boolean(
-        transcribedData?.bilingual &&
-            chunks.some((chunk) => String(chunk.trans ?? "").trim().length > 0),
+    // The translations live inside the chunks themselves, so this survives
+    // switching between files (and works for results stored by older runs).
+    const hasTranslation = chunks.some(
+        (chunk) => String(chunk.trans ?? "").trim().length > 0,
     );
+    const bilingual = hasTranslation;
 
-    const exportAs = (format: "txt" | "srt" | "json") => {
-        exportChunks(chunks, fileName ?? "transcript", format, { bilingual });
+    /** `withTranslation` is explicit: the UI offers both variants. */
+    const exportAs = (
+        format: "txt" | "srt" | "json",
+        withTranslation: boolean,
+    ) => {
+        exportChunks(chunks, fileName ?? "transcript", format, {
+            bilingual: withTranslation,
+        });
     };
 
     const activeIndex = useMemo(
@@ -129,31 +142,82 @@ export default function Transcript({
                 );
             })}
             {transcribedData && !transcribedData.isBusy && (
-                <div className='w-full text-right'>
-                    <button
-                        onClick={() => exportAs("txt")}
-                        className='text-white bg-green-500 hover:bg-green-600 focus:ring-4 focus:ring-green-300 font-medium rounded-lg text-sm px-4 py-2 text-center mr-2 dark:bg-green-600 dark:hover:bg-green-700 dark:focus:ring-green-800 inline-flex items-center'
-                    >
-                        Export TXT
-                    </button>
-                    <button
-                        onClick={() => exportAs("srt")}
-                        className='text-white bg-green-500 hover:bg-green-600 focus:ring-4 focus:ring-green-300 font-medium rounded-lg text-sm px-4 py-2 text-center mr-2 dark:bg-green-600 dark:hover:bg-green-700 dark:focus:ring-green-800 inline-flex items-center'
-                    >
-                        Export SRT
-                    </button>
-                    <button
-                        onClick={() => exportAs("json")}
-                        className='text-white bg-green-500 hover:bg-green-600 focus:ring-4 focus:ring-green-300 font-medium rounded-lg text-sm px-4 py-2 text-center mr-2 dark:bg-green-600 dark:hover:bg-green-700 dark:focus:ring-green-800 inline-flex items-center'
-                    >
-                        Export JSON
-                    </button>
-                    {bilingual && (
-                        <div className='mt-1 text-xs text-slate-400'>
-                            TXT / SRT 导出包含原文与译文（文件名带
-                            .bilingual），JSON 中每句带 trans 字段。
-                        </div>
-                    )}
+                <div className='w-full'>
+                    <div className='w-full text-right'>
+                        <button
+                            onClick={() => exportAs("txt", false)}
+                            className={exportButtonClass}
+                        >
+                            Export TXT
+                        </button>
+                        <button
+                            onClick={() => exportAs("srt", false)}
+                            className={exportButtonClass}
+                        >
+                            Export SRT
+                        </button>
+                        <button
+                            onClick={() => exportAs("json", false)}
+                            className={exportButtonClass}
+                        >
+                            Export JSON
+                        </button>
+                    </div>
+                    <div className='w-full text-right mt-1'>
+                        <button
+                            disabled={!bilingual}
+                            title={
+                                bilingual
+                                    ? "导出原文 + 译文"
+                                    : "当前字幕没有译文，请先运行 Bilingual"
+                            }
+                            onClick={() => exportAs("txt", true)}
+                            className={
+                                bilingual
+                                    ? exportButtonClass
+                                    : exportButtonDisabledClass
+                            }
+                        >
+                            Export TXT (bilingual)
+                        </button>
+                        <button
+                            disabled={!bilingual}
+                            title={
+                                bilingual
+                                    ? "导出原文 + 译文"
+                                    : "当前字幕没有译文，请先运行 Bilingual"
+                            }
+                            onClick={() => exportAs("srt", true)}
+                            className={
+                                bilingual
+                                    ? exportButtonClass
+                                    : exportButtonDisabledClass
+                            }
+                        >
+                            Export SRT (bilingual)
+                        </button>
+                        <button
+                            disabled={!bilingual}
+                            title={
+                                bilingual
+                                    ? "每条带 trans 字段"
+                                    : "当前字幕没有译文，请先运行 Bilingual"
+                            }
+                            onClick={() => exportAs("json", true)}
+                            className={
+                                bilingual
+                                    ? exportButtonClass
+                                    : exportButtonDisabledClass
+                            }
+                        >
+                            Export JSON (bilingual)
+                        </button>
+                    </div>
+                    <div className='mt-1 text-xs text-slate-400 text-right'>
+                        第一排只导出原文；第二排带 (bilingual)
+                        的同时导出原文与译文，文件名带 .bilingual。
+                        {!bilingual && " 当前字幕没有译文，第二排暂不可用。"}
+                    </div>
                 </div>
             )}
         </div>

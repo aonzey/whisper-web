@@ -171,8 +171,18 @@ interface AudioItem {
     /** Original file, kept so the API engine can upload it untouched. */
     file?: Blob;
     status: "pending" | "done" | "error";
-    result?: { text: string; chunks: Chunk[] };
+    /**
+     * `bilingual` travels with the result: the subtitle list only renders the
+     * translations when the flag is set, so dropping it here made every
+     * translation disappear as soon as the user switched files in a batch.
+     */
+    result?: { text: string; chunks: Chunk[]; bilingual?: boolean };
 }
+
+const smallExportClass =
+    "text-white bg-green-500 hover:bg-green-600 font-medium rounded-lg text-xs px-3 py-1.5";
+const smallExportDisabledClass =
+    "text-white bg-gray-300 cursor-not-allowed font-medium rounded-lg text-xs px-3 py-1.5";
 
 const AUDIO_EXTENSION =
     /\.(mp3|wav|m4a|aac|ogg|oga|opus|flac|weba|webm|mp4|mpeg|mpga|aiff|aif|wma)$/i;
@@ -273,6 +283,7 @@ export function AudioManager(props: {
                 isBusy: false,
                 text: item.result.text,
                 chunks: item.result.chunks,
+                bilingual: Boolean(item.result.bilingual),
             });
         } else {
             props.transcriber.onInputChange();
@@ -344,7 +355,11 @@ export function AudioManager(props: {
         if (lastOutputRef.current === output) return;
         lastOutputRef.current = output;
 
-        const result = { text: output.text, chunks: output.chunks };
+        const result = {
+            text: output.text,
+            chunks: output.chunks,
+            bilingual: Boolean(output.bilingual),
+        };
         const currentBatch = batchRef.current;
 
         if (currentBatch && currentBatch.running) {
@@ -600,14 +615,18 @@ export function AudioManager(props: {
         ),
     );
 
-    const exportAllAs = (format: "json" | "txt" | "srt") => {
+    /** `withTranslation` is explicit: the UI offers both variants. */
+    const exportAllAs = (
+        format: "json" | "txt" | "srt",
+        withTranslation: boolean,
+    ) => {
         exportAll(
             doneItems.map((item) => ({
                 name: item.name,
                 chunks: item.result?.chunks ?? [],
             })),
             format,
-            { bilingual: anyBilingual },
+            { bilingual: withTranslation },
         );
     };
 
@@ -723,28 +742,86 @@ export function AudioManager(props: {
                             {items.length} files · {doneItems.length}{" "}
                             transcribed
                         </span>
-                        <span className='flex space-x-2'>
-                            <button
-                                disabled={doneItems.length === 0}
-                                onClick={() => exportAllAs("json")}
-                                className='text-white bg-green-500 hover:bg-green-600 disabled:bg-gray-300 font-medium rounded-lg text-xs px-3 py-1.5'
-                            >
-                                Export All JSON
-                            </button>
-                            <button
-                                disabled={doneItems.length === 0}
-                                onClick={() => exportAllAs("txt")}
-                                className='text-white bg-green-500 hover:bg-green-600 disabled:bg-gray-300 font-medium rounded-lg text-xs px-3 py-1.5'
-                            >
-                                Export All TXT
-                            </button>
-                            <button
-                                disabled={doneItems.length === 0}
-                                onClick={() => exportAllAs("srt")}
-                                className='text-white bg-green-500 hover:bg-green-600 disabled:bg-gray-300 font-medium rounded-lg text-xs px-3 py-1.5'
-                            >
-                                Export All SRT
-                            </button>
+                        <span className='flex flex-col items-end gap-1'>
+                            <span className='flex space-x-2'>
+                                <button
+                                    disabled={doneItems.length === 0}
+                                    onClick={() => exportAllAs("json", false)}
+                                    className={smallExportClass}
+                                >
+                                    Export All JSON
+                                </button>
+                                <button
+                                    disabled={doneItems.length === 0}
+                                    onClick={() => exportAllAs("txt", false)}
+                                    className={smallExportClass}
+                                >
+                                    Export All TXT
+                                </button>
+                                <button
+                                    disabled={doneItems.length === 0}
+                                    onClick={() => exportAllAs("srt", false)}
+                                    className={smallExportClass}
+                                >
+                                    Export All SRT
+                                </button>
+                            </span>
+                            <span className='flex space-x-2'>
+                                <button
+                                    disabled={
+                                        doneItems.length === 0 || !anyBilingual
+                                    }
+                                    title={
+                                        anyBilingual
+                                            ? "导出原文 + 译文"
+                                            : "还没有任何文件带译文，请先运行 Bilingual"
+                                    }
+                                    onClick={() => exportAllAs("json", true)}
+                                    className={
+                                        anyBilingual
+                                            ? smallExportClass
+                                            : smallExportDisabledClass
+                                    }
+                                >
+                                    Export All JSON (bilingual)
+                                </button>
+                                <button
+                                    disabled={
+                                        doneItems.length === 0 || !anyBilingual
+                                    }
+                                    title={
+                                        anyBilingual
+                                            ? "导出原文 + 译文"
+                                            : "还没有任何文件带译文，请先运行 Bilingual"
+                                    }
+                                    onClick={() => exportAllAs("txt", true)}
+                                    className={
+                                        anyBilingual
+                                            ? smallExportClass
+                                            : smallExportDisabledClass
+                                    }
+                                >
+                                    Export All TXT (bilingual)
+                                </button>
+                                <button
+                                    disabled={
+                                        doneItems.length === 0 || !anyBilingual
+                                    }
+                                    title={
+                                        anyBilingual
+                                            ? "导出原文 + 译文"
+                                            : "还没有任何文件带译文，请先运行 Bilingual"
+                                    }
+                                    onClick={() => exportAllAs("srt", true)}
+                                    className={
+                                        anyBilingual
+                                            ? smallExportClass
+                                            : smallExportDisabledClass
+                                    }
+                                >
+                                    Export All SRT (bilingual)
+                                </button>
+                            </span>
                         </span>
                     </div>
                     <ul className='max-h-48 overflow-y-auto divide-y divide-slate-100'>

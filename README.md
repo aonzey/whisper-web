@@ -169,22 +169,32 @@ npm run server       # API 会顺带托管 dist/，直接访问 http://localhost
 队列里有多个文件时，按钮变成 **Transcribe All (N)**，会**按顺序**逐个转写
 （不做并发，避免显存/内存爆掉）。全部完成后可以：
 
-- **Export All TXT**
-- **Export All SRT**
-- **Export All JSON**
+- **Export All TXT / SRT / JSON** — 只导出原文
+- **Export All TXT / SRT / JSON (bilingual)** — 原文 + 译文
+  （没有任何文件带译文时这一排是禁用的）
 
 批量导出是逐个触发下载，间隔约 400ms（浏览器会保存成多个文件，不要拦截弹窗）。
-文件名取自源文件名（去掉扩展名）。
+文件名取自源文件名（去掉扩展名），带译文的会多一个 `.bilingual` 后缀。
+
+> 切换查看不同文件时，字幕列表会连同译文一起恢复（`AudioItem.result` 里
+> 保存了 `bilingual` 标志）。
 
 ### 5. 导出格式与 `trans` 字段
 
-单条结果和批量结果都支持三种格式：
+单条结果和批量结果都支持三种格式，每种都有「只导出原文」和「原文 + 译文」
+两个按钮：
 
 | 按钮 | 扩展名 | 内容 |
 | --- | --- | --- |
 | **Export TXT** | `.txt` | 所有 chunk 文本拼接（保留原有前导空格分隔） |
 | **Export SRT** | `.srt` | SubRip 字幕，带序号与 `HH:MM:SS,mmm --> HH:MM:SS,mmm` |
-| **Export JSON** | `.json` | 结构化数组，每行含 `timestamp` / `text` / `trans` |
+| **Export JSON** | `.json` | 结构化数组，每行含 `timestamp` / `text` |
+| **Export TXT (bilingual)** | `.bilingual.txt` | 每句原文下面跟一行译文 |
+| **Export SRT (bilingual)** | `.bilingual.srt` | 同上，字幕块内两行 |
+| **Export JSON (bilingual)** | `.bilingual.json` | 每行额外带 `trans` 字段 |
+
+带 (bilingual) 的一排在没有译文时禁用；文件名统一加 `.bilingual`，避免两种
+导出互相覆盖。
 
 JSON 结构（`trans` 是预留的译文/校对字段，默认空字符串，方便后续挂翻译流程）：
 
@@ -320,7 +330,8 @@ Settings 弹窗**左右并列两栏**：左边 `Transcription engine`，右边
 界面与导出：
 
 - 列表每句显示两行：原文 + 译文；
-- 三个 Export 按钮全部导出双语内容（见[第 5 节](#5-导出格式与-trans-字段)）；
+- 导出有两排：第一排只导出原文，第二排带 (bilingual) 的导出原文 + 译文
+  （见[第 5 节](#5-导出格式与-trans-字段)）；
 - 批量模式下也是「每个文件转写 → 翻译 → 再下一个文件」。
 
 ### 三种 Translation engine 怎么选

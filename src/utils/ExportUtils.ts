@@ -42,10 +42,13 @@ export function exportChunks(
     const base = baseFilename(name);
     const list = chunks ?? [];
     // Default to bilingual output as soon as a translation is present, so the
-    // download always matches what the page shows.
+    // download always matches what the page shows. Callers that offer an
+    // explicit "with / without translation" choice pass `bilingual` outright.
     const bilingual = options?.bilingual ?? chunksAreBilingual(list);
     const { body, mime, ext } = exportContent(list, format, { bilingual });
-    const suffix = bilingual && ext !== "json" ? ".bilingual" : "";
+    // Always name the two variants differently, otherwise picking "without
+    // translation" after "with translation" silently overwrites the file.
+    const suffix = bilingual ? ".bilingual" : "";
     saveBlob(new Blob([body], { type: mime }), `${base}${suffix}.${ext}`);
 }
 

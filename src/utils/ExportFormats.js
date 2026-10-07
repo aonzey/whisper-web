@@ -99,13 +99,20 @@ export function chunksToSRT(chunks, options) {
 /**
  * Serialize chunks to JSON. Every chunk carries an extra (empty) `trans`
  * field which is reserved for a manual/translated version of the line.
+ *
+ * `options.bilingual === false` drops the field entirely, so the export
+ * matches the "原文 only" variant of txt / srt.
  */
-export function chunksToJSON(chunks) {
-    const data = (chunks || []).map((chunk) => ({
-        timestamp: chunk.timestamp ?? [0, null],
-        text: chunk.text ?? "",
-        trans: chunk.trans ?? "",
-    }));
+export function chunksToJSON(chunks, options) {
+    const withTrans = options?.bilingual !== false;
+    const data = (chunks || []).map((chunk) => {
+        const entry = {
+            timestamp: chunk.timestamp ?? [0, null],
+            text: chunk.text ?? "",
+        };
+        if (withTrans) entry.trans = chunk.trans ?? "";
+        return entry;
+    });
 
     let jsonData = JSON.stringify(data, null, 2);
 
@@ -134,7 +141,7 @@ export function exportContent(chunks, format, options) {
             };
         default:
             return {
-                body: chunksToJSON(chunks),
+                body: chunksToJSON(chunks, options),
                 mime: "application/json; charset=utf-8",
                 ext: "json",
             };
