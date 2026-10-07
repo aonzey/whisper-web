@@ -345,7 +345,19 @@ npm run fetch-model -- --force                   # 已存在也重新下载
 npm run fetch-model -- --dry-run                 # 只打印将要下载什么
 npm run fetch-model -- --mirror https://hf-mirror.com/
 npm run fetch-model -- --revision main           # 指定分支 / commit
+npm run fetch-model -- --type=translation        # 强制放到某个目录
 ```
+
+**下载到哪个目录由仓库 `config.json` 的 `model_type` 决定**（与服务端分类缓存用的是
+同一套规则），不会再下错目录：
+
+| `model_type` | 目录 |
+| --- | --- |
+| `whisper` | `.cache\Transcription models\<model-id>\` |
+| `marian`（opus-mt）、`m2m_100`（nllb / m2m100）、`mbart`、`bart`、`t5` | `.cache\Translation models\<model-id>\` |
+
+判定依据会打印在 `type : whisper → asr（config.json model_type=whisper）` 这一行；
+`--list` / `--dry-run` 也会打印，可用 `--type=asr|translation` 强制指定。
 
 **任意仓库都能下（不再只支持 Xenova/*）**。脚本会先用仓库 API 列出文件
 （Hugging Face `/api/models/<id>/tree/<rev>`、ModelScope
