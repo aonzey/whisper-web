@@ -46,6 +46,50 @@ export type ApiTarget =
     | { kind: "self"; baseUrl: string }
     | { kind: "openai"; baseUrl: string; endpoint: string };
 
+/**
+ * Model ids already stored in **this browser** (Cache Storage
+ * `transformers-cache`), e.g. after a "Browser" engine run.
+ *
+ * This is a completely different place from the server's `.cache` folders, so
+ * the Settings dropdown has to keep the two apart: an id listed here is
+ * immediately usable by the in-browser engine, while a server side one needs
+ * the local engine (or the `/models` route of a running server).
+ */
+export async function listBrowserCachedModels(): Promise<string[]> {
+    if (typeof caches === "undefined") return [];
+    try {
+        const cache = await caches.open("transformers-cache");
+        const requests = await cache.keys();
+        const ids = new Set<string>();
+        for (const request of requests) {
+            const id = modelIdFromCacheUrl(String(request.url));
+            if (id) ids.add(id);
+        }
+        return [...ids].sort();
+    } catch (error) {
+        return [];
+    }
+}
+
+/**
+ * Pull the `<org>/<name>` id out of a cached weight url:
+ *   https://huggingface.co/Xenova/nllb-200-distilled-600M/resolve/main/tokenizer.json
+ *   http://localhost:8787/models/Xenova/nllb-200-distilled-600M/tokenizer.json
+ */
+function modelIdFromCacheUrl(url: string): string {
+    try {
+        const pathname = new URL(url).pathname.replace(/^\/+/, "");
+        // Our own server serves the weights below `/models/`.
+        const withoutPrefix = pathname.replace(/^models\//, "");
+        const parts = withoutPrefix.split("/").filter(Boolean);
+        if (parts.length >= 3) return `${parts[0]}/${parts[1]}`;
+        if (parts.length === 2) return parts[0];
+        return "";
+    } catch (error) {
+        return "";
+    }
+}
+
 /** Base url used to reach our own server (the relay). */
 export const SELF_API_BASE = "/api";
 

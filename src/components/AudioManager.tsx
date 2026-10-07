@@ -26,6 +26,7 @@ import {
     fetchApiModels,
     classifyApiBase,
     describeApiTarget,
+    listBrowserCachedModels,
     SELF_API_BASE,
     ApiModelOption,
 } from "../utils/ApiClient";
@@ -931,6 +932,12 @@ function SettingsModal(props: {
     const [mtModels, setMtModels] = useState<ApiModelOption[]>([]);
     const [mtStatus, setMtStatus] = useState<string>("");
     const [mtLoading, setMtLoading] = useState(false);
+    /**
+     * Weights downloaded by the *browser* engine (Cache Storage
+     * `transformers-cache`). Kept strictly apart from `mtModels` / `asrModels`,
+     * which describe the server's `.cache` folders.
+     */
+    const [browserCached, setBrowserCached] = useState<string[]>([]);
 
     const [customModel, setCustomModel] = useState(false);
     const [customTranslationModel, setCustomTranslationModel] = useState(false);
@@ -1079,7 +1086,15 @@ function SettingsModal(props: {
         loadedSignature.current = autoLoadSignature;
         void loadAsrModels();
         void loadMtModels();
+        void listBrowserCachedModels().then(setBrowserCached);
     }, [props.show, autoLoadSignature, loadAsrModels, loadMtModels]);
+
+    // Browser cache split by task, so neither column ever shows the other's
+    // models as if they were its own.
+    const browserAsrCached = browserCached.filter((id) => /whisper/i.test(id));
+    const browserMtCached = browserCached.filter((id) =>
+        /nllb|m2m|opus|mbart|mt5|translation/i.test(id),
+    );
 
     // Model choices: server list when available, otherwise built-in aliases.
     const fallbackIds =
@@ -1166,6 +1181,15 @@ function SettingsModal(props: {
     const cachedTranslationModels = mtModels
         .filter((option) => option.cached)
         .filter((option) => !isBrokenTranslationModel(option.id))
+        // When the browser already holds the weights it is the faster source,
+        // so list them once, under "本浏览器已缓存".
+        .filter(
+            (option) =>
+                !(
+                    translationEngine === "browser" &&
+                    browserMtCached.includes(option.id)
+                ),
+        )
         .map((option) => ({
             id: option.id,
             // The chat endpoint cannot run 🤗 weights — say so instead of
@@ -1205,6 +1229,11 @@ function SettingsModal(props: {
             ) &&
             !upstreamTranslationModels.some(
                 (remote) => remote.id === option.id,
+            ) &&
+            // Already listed under "本浏览器已缓存" — do not show it twice.
+            !(
+                translationEngine === "browser" &&
+                browserMtCached.includes(option.id)
             ),
     );
     const translationModelOptions = [
@@ -1218,6 +1247,19 @@ function SettingsModal(props: {
     const translationModelInList = translationModelList.includes(
         currentTranslationModel,
     );
+    // Group labels: the two caches live in completely different places, so
+    // they never appear under the same heading.
+    const serverCacheLabel =
+        translationEngine === "local"
+            ? "服务端已缓存（.cache\\Translation models · 本地引擎直接用）"
+            : translationEngine === "browser"
+            ? "服务端已缓存（.cache\\Translation models · 经本地服务端的 /models 拉到浏览器）"
+            : "服务端已缓存（本地引擎权重 · 聊天引擎用不到，切到本地引擎才可用）";
+    const browserCacheLabel = "本浏览器已缓存（浏览器引擎可直接用）";
+    const presetLabel =
+        translationEngine === "api"
+            ? "内置聊天模型"
+            : "🤗 翻译模型预设（首次使用会下载）";
 
     // Which languages the selected model can actually produce. nllb wants
     // `zho_Hans` style codes, m2m100 plain `zh`, opus-mt-* a single language.
@@ -1404,7 +1446,13 @@ function SettingsModal(props: {
                                                 {" — 当前值（不在列表中）"}
                                             </option>
                                         )}
-                                        <optgroup label='已缓存（服务端可直接用）'>
+                                        <optgroup
+                                            label={
+                                                isServerLocal
+                                                    ? "服务端已缓存（.cache\\Transcription models · 本地引擎直接用）"
+                                                    : "服务端已缓存（本地引擎权重 · Server API 端点用不到）"
+                                            }
+                                        >
                                             {modelOptions
                                                 .filter((o) => o.cached)
                                                 .map((o) => (
@@ -1466,42 +1514,61 @@ function SettingsModal(props: {
                                         );
                                     }}
                                 >
-                                    {Object.keys(models)
-                                        .filter(
-                                            (key) =>
-                                                props.transcriber.quantized ||
-                                                // @ts-ignore
-                                                models[key].length == 2,
-                                        )
-                                        .filter(
-                                            (key) =>
-                                                !props.transcriber
-                                                    .multilingual ||
-                                                !key.startsWith(
-                                                    "distil-whisper/",
-                                                ),
-                                        )
-                                        .map((key) => (
-                                            <option
-                                                key={key}
-                                                value={key}
-                                            >{`${key}${
-                                                props.transcriber
-                                                    .multilingual ||
-                                                key.startsWith(
-                                                    "distil-whisper/",
-                                                )
-                                                    ? ""
-                                                    : ".en"
-                                            } (${
-                                                // @ts-ignore
-                                                models[key][
-                                                    props.transcriber.quantized
-                                                        ? 0
-                                                        : 1
-                                                ]
-                                            }MB)`}</option>
-                                        ))}
+                                    {browserAsrCached.length > 0 && (
+                                        <optgroup label='本浏览器已缓存（浏览器引擎可直接用）'>
+                                            {browserAsrCached.map((id) => (
+                                                <option key={id} value={id}>
+                                                    {id} — 已在浏览器内
+                                                </option>
+                                            ))}
+                                        </optgroup>
+                                    )}
+                                    <optgroup label='🤗 转写模型（首次使用会下载到浏览器）'>
+                                        {Object.keys(models)
+                                            .filter(
+                                                (key) =>
+                                                    props.transcriber
+                                                        .quantized ||
+                                                    // @ts-ignore
+                                                    models[key].length == 2,
+                                            )
+                                            .filter(
+                                                (key) =>
+                                                    !props.transcriber
+                                                        .multilingual ||
+                                                    !key.startsWith(
+                                                        "distil-whisper/",
+                                                    ),
+                                            )
+                                            .filter(
+                                                (key) =>
+                                                    !browserAsrCached.includes(
+                                                        key,
+                                                    ),
+                                            )
+                                            .map((key) => (
+                                                <option
+                                                    key={key}
+                                                    value={key}
+                                                >{`${key}${
+                                                    props.transcriber
+                                                        .multilingual ||
+                                                    key.startsWith(
+                                                        "distil-whisper/",
+                                                    )
+                                                        ? ""
+                                                        : ".en"
+                                                } (${
+                                                    // @ts-ignore
+                                                    models[key][
+                                                        props.transcriber
+                                                            .quantized
+                                                            ? 0
+                                                            : 1
+                                                    ]
+                                                }MB)`}</option>
+                                            ))}
+                                    </optgroup>
                                 </select>
                                 <div className='flex justify-between items-center mb-3 px-1'>
                                     <div className='flex'>
@@ -1753,15 +1820,66 @@ function SettingsModal(props: {
                                         {" — 当前值（不在列表中）"}
                                     </option>
                                 )}
-                                {translationModelOptions.map((option) => (
-                                    <option key={option.id} value={option.id}>
-                                        {option.id}
-                                        {option.size
-                                            ? ` — ${option.size}`
-                                            : ""}{" "}
-                                        · {option.note}
-                                    </option>
-                                ))}
+                                {translationEngine === "browser" &&
+                                    browserMtCached.length > 0 && (
+                                        <optgroup label={browserCacheLabel}>
+                                            {browserMtCached.map((id) => (
+                                                <option key={id} value={id}>
+                                                    {id} — 已在浏览器内
+                                                </option>
+                                            ))}
+                                        </optgroup>
+                                    )}
+                                {cachedTranslationModels.length > 0 && (
+                                    <optgroup label={serverCacheLabel}>
+                                        {cachedTranslationModels.map(
+                                            (option) => (
+                                                <option
+                                                    key={option.id}
+                                                    value={option.id}
+                                                >
+                                                    {option.id}
+                                                    {option.size
+                                                        ? ` — ${option.size}`
+                                                        : ""}{" "}
+                                                    · {option.note}
+                                                </option>
+                                            ),
+                                        )}
+                                    </optgroup>
+                                )}
+                                {upstreamTranslationModels.length > 0 && (
+                                    <optgroup label='上游聊天模型（第三方端点）'>
+                                        {upstreamTranslationModels.map(
+                                            (option) => (
+                                                <option
+                                                    key={option.id}
+                                                    value={option.id}
+                                                >
+                                                    {option.id}
+                                                </option>
+                                            ),
+                                        )}
+                                    </optgroup>
+                                )}
+                                {presetTranslationModels.length > 0 && (
+                                    <optgroup label={presetLabel}>
+                                        {presetTranslationModels.map(
+                                            (option) => (
+                                                <option
+                                                    key={option.id}
+                                                    value={option.id}
+                                                >
+                                                    {option.id}
+                                                    {option.size
+                                                        ? ` — ${option.size}`
+                                                        : ""}{" "}
+                                                    · {option.note}
+                                                </option>
+                                            ),
+                                        )}
+                                    </optgroup>
+                                )}
                             </select>
                         )}
                         {mtStatus && (
@@ -1773,6 +1891,16 @@ function SettingsModal(props: {
                                 }`}
                             >
                                 {mtStatus}
+                            </p>
+                        )}
+                        {translationEngine === "browser" && (
+                            <p className='text-xs text-slate-400 mb-2 break-all'>
+                                本浏览器已缓存的翻译模型（Cache Storage）：
+                                {browserMtCached.length
+                                    ? browserMtCached.join("、")
+                                    : "无，首次使用会自动下载到浏览器"}
+                                。这与服务端 .cache\Translation models
+                                是两份独立的缓存，上面已分开列出。
                             </p>
                         )}
 

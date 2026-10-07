@@ -27,8 +27,10 @@
  *     <cache>/Transcription models/<model-id>/...   (Whisper / ASR)
  *     <cache>/Translation models/<model-id>/...     (opus-mt, nllb, ...)
  *
- * The folder is picked automatically (Whisper layout → Transcription models,
- * anything else → Translation models) and can be forced with `--type=`.
+ * The folder is picked from the repo's `config.json` → `model_type`
+ * (whisper → Transcription models, marian/m2m100/nllb/mBART/t5 → Translation
+ * models), falling back to the model name and only then to the repo layout.
+ * Force it with `--type=`.
  *
  * Options
  *   --list              只列出仓库里的文件并退出（不下载）
@@ -300,6 +302,35 @@ async function fetchJson(url) {
     return response.json();
 }
 
+/**
+ * Read `model_type` out of the repository's config.json.
+ * This is the same signal the API server uses to tag a cached model as
+ * `asr` / `translation`, so both sides always agree on the folder.
+ */
+async function readModelType(files, mirror, revision) {
+    const hit = findFile(files, "config.json");
+    if (!hit) return "";
+    try {
+        const response = await fetch(
+            mirror.resolve(modelId, hit.path, revision),
+            { redirect: "follow" },
+        );
+        if (!response.ok) return "";
+        const config = JSON.parse(await response.text());
+        return String(config?.model_type ?? "").toLowerCase();
+    } catch (error) {
+        return "";
+    }
+}
+
+/** Map a `model_type` onto a cache sub-folder ("" = unknown). */
+function categoryFromModelType(type) {
+    if (!type) return "";
+    if (/whisper/.test(type)) return "asr";
+    if (/marian|m2m|mbart|bart|t5|nllb|opus/i.test(type)) return "translation";
+    return "";
+}
+
 /** Ask every mirror for the repository file list; returns the first hit. */
 async function listRepoFiles() {
     const failures = [];
@@ -347,6 +378,16 @@ async function main() {
             process.exit(1);
         }
         printList(files);
+        const listType = await readModelType(files, mirror, revision);
+        const listCategory =
+            categoryFromModelType(listType) || guessCategory(modelId);
+        console.log(
+            `\nmodel_type: ${listType || "(未知)"} → ${listCategory}`,
+        );
+        console.log(
+            `将下载到: ${path.join(dirFor(listCategory), modelId)}` +
+                `（可用 --type=asr|translation 强制）`,
+        );
         return;
     }
 
@@ -362,6 +403,37 @@ async function main() {
     }
 
     console.log(`revision: ${revision} (via ${mirror.name})`);
+
+    // Decide the cache sub-folder *before* downloading anything.
+    // `config.json` → `model_type` is the authoritative signal (the server
+    // classifies cached models the same way); the repo layout is only a
+    // fallback because m2m100 / mBART also ship encoder + merged decoder.
+    const encoder = pickWeight(files, ENCODER_VARIANTS, "encoder_model");
+    const decoder = pickWeight(files, DECODER_VARIANTS, "decoder_model_merged");
+    const isWhisperLayout = Boolean(encoder || decoder);
+
+    const modelType = await readModelType(files, mirror, revision);
+    const fromType = categoryFromModelType(modelType);
+    let category;
+    let categoryReason;
+    if (typeArg === "asr" || typeArg === "translation") {
+        category = typeArg;
+        categoryReason = "--type 指定";
+    } else if (fromType) {
+        category = fromType;
+        categoryReason = `config.json model_type=${modelType}`;
+    } else if (category === "translation") {
+        category = "translation";
+        categoryReason = "模型名命中翻译模型（opus-mt / nllb / m2m100 / mbart …）";
+    } else {
+        category = isWhisperLayout ? "asr" : "translation";
+        categoryReason = isWhisperLayout
+            ? "仓库含 Whisper 布局（config.json 不可用，按布局判断）"
+            : "非 Whisper 布局，按通用 ONNX 翻译模型处理";
+    }
+    CACHE_DIR = dirFor(category);
+    console.log(`type    : ${modelType || "(未知)"} → ${category}（${categoryReason}）`);
+    console.log(`folder  : ${path.join(CACHE_DIR, modelId)}`);
     console.log("");
 
     /** @type {{source: string, target: string, optional: boolean, note?: string}[]} */
@@ -380,19 +452,8 @@ async function main() {
     CONFIG_RECOMMENDED.forEach((name) => addConfig(name, true));
     CONFIG_OPTIONAL.forEach((name) => addConfig(name, true));
 
-    const encoder = pickWeight(files, ENCODER_VARIANTS, "encoder_model");
-    const decoder = pickWeight(
-        files,
-        DECODER_VARIANTS,
-        "decoder_model_merged",
-    );
-
     /** @type {{source: string, target: string, optional: boolean, note?: string, missing?: boolean, base?: string}[]} */
     const weights = [];
-
-    // Not a Whisper export (translation models, custom ONNX repos, ...) —
-    // 🤗 Transformers.js loads those from `onnx/model[_quantized].onnx`.
-    const isWhisperLayout = Boolean(encoder || decoder);
 
     if (!isWhisperLayout) {
         console.log(
@@ -509,19 +570,6 @@ async function main() {
         process.exit(1);
     }
 
-    // Final folder: Whisper layout → "Transcription models", anything else
-    // (opus-mt / nllb / generic ONNX) → "Translation models".
-    // `guessCategory` wins: m2m100 / mBART also ship `encoder_model` +
-    // `decoder_model_merged` ONNX files, so the layout alone cannot tell
-    // them apart from a Whisper export.
-    if (!typeArg) {
-        category =
-            category === "translation" || !isWhisperLayout
-                ? "translation"
-                : "asr";
-        CACHE_DIR = dirFor(category);
-    }
-    console.log(`folder  : ${path.join(CACHE_DIR, modelId)}  [${category}]`);
     console.log("");
 
     for (const weight of weights) {

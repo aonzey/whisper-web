@@ -224,7 +224,15 @@ function resolveModelDir(model, prefer = "asr") {
     if (!model || model.includes("..")) {
         return { root: fallback, dir: path.join(fallback, model ?? "") };
     }
-    for (const root of [ASR_CACHE_DIR, MT_CACHE_DIR, CACHE_ROOT]) {
+    // Look in the folder that matches the requested purpose first: a model
+    // that was downloaded into the wrong sub-folder must not shadow the
+    // correct one. The other folder is still scanned so older caches keep
+    // working.
+    const roots =
+        prefer === "translation"
+            ? [MT_CACHE_DIR, ASR_CACHE_DIR, CACHE_ROOT]
+            : [ASR_CACHE_DIR, MT_CACHE_DIR, CACHE_ROOT];
+    for (const root of roots) {
         const dir = path.join(root, model);
         if (fs.existsSync(dir) && looksLikeModelDir(dir)) {
             return { root, dir };
