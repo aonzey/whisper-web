@@ -1113,16 +1113,15 @@ function SettingsModal(props: {
     // Translation models (opus-mt / nllb / ...) also ship an
     // `encoder_model*.onnx`, so `/api/models` reports them too — never offer
     // them as a transcription model.
+    const fallbackOptions: ApiModelOption[] = fallbackIds.map((id) => ({
+        id,
+        note: "内置别名",
+        cached: false,
+        kind: "alias" as const,
+        task: "",
+    }));
     const modelOptions: ApiModelOption[] = (
-        asrModels.length > 0
-            ? asrModels
-            : fallbackIds.map((id) => ({
-                  id,
-                  note: "内置别名",
-                  cached: false,
-                  kind: "alias" as const,
-                  task: "",
-              }))
+        asrModels.length > 0 ? asrModels : fallbackOptions
     ).filter((option: ApiModelOption) => option.task !== "translation");
     const currentInList = modelOptions.some((o) => o.id === currentModel);
     const cachedAsrModels = modelOptions.filter((option) => option.cached);
@@ -1194,10 +1193,13 @@ function SettingsModal(props: {
             id: option.id,
             // The chat endpoint cannot run 🤗 weights — say so instead of
             // silently offering an unusable model.
-            note:
-                translationEngine === "local"
-                    ? "已缓存（服务端 .cache\\Translation models）"
-                    : "已缓存（服务端 · 需切换到本地引擎才能用）",
+            note: option.incomplete
+                ? `已缓存但不完整 · 缺 ${(
+                      option.missingFiles ?? []
+                  ).join("、")} · 需重新下载`
+                : translationEngine === "local"
+                ? "已缓存（服务端 .cache\\Translation models）"
+                : "已缓存（服务端 · 需切换到本地引擎才能用）",
             multilingual: true,
             size: "",
         }));
@@ -1246,6 +1248,12 @@ function SettingsModal(props: {
     );
     const translationModelInList = translationModelList.includes(
         currentTranslationModel,
+    );
+    // Weights present but `tokenizer.json` missing → transformers.js cannot
+    // load the tokenizer at all. Tell the user how to repair it instead of
+    // letting the run fail with a cryptic "file was not found locally".
+    const currentMtIncomplete = mtModels.find(
+        (option) => option.id === currentTranslationModel && option.incomplete,
     );
     // Group labels: the two caches live in completely different places, so
     // they never appear under the same heading.
@@ -1881,6 +1889,21 @@ function SettingsModal(props: {
                                     </optgroup>
                                 )}
                             </select>
+                        )}
+                        {currentMtIncomplete && (
+                            <p className='text-xs text-amber-600 mb-2 break-all'>
+                                该模型缓存不完整，缺少{" "}
+                                {(currentMtIncomplete.missingFiles ?? []).join(
+                                    "、",
+                                )}
+                                ——transformers.js 没有 tokenizer.json
+                                就无法加载，运行时会报 “file was not found
+                                locally”。请在项目目录执行：
+                                <code className='bg-slate-100 px-1 rounded'>
+                                    npm run fetch-model --{" "}
+                                    {currentTranslationModel} --force
+                                </code>
+                            </p>
                         )}
                         {mtStatus && (
                             <p

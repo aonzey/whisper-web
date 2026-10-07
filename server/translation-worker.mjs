@@ -50,6 +50,10 @@ async function getTranslator({ model, quantized, cacheDir, allowRemote }) {
     env.useFSCache = true;
     env.allowRemoteModels = Boolean(allowRemote);
     env.cacheDir = cacheDir;
+    // Without this transformers.js looks for the model under its own
+    // `node_modules/@xenova/transformers/models/` folder, so a cache miss
+    // reports a path that has nothing to do with our `.cache` directory.
+    if (cacheDir) env.localModelPath = cacheDir;
     if (process.env.HF_ENDPOINT) {
         env.remoteHost = process.env.HF_ENDPOINT.replace(/\/?$/, "/");
     }
@@ -141,10 +145,16 @@ async function handle(message) {
         ...options,
         max_new_tokens: options.max_new_tokens ?? maxNewTokensFor(text),
     };
-    const output = await translator(text, merged);
-    const translations = (Array.isArray(output) ? output : [output]).map(
-        (item) => item?.translation_text ?? "",
-    );
+    // One call per line: transformers.js pads when it is handed an array,
+    // and the padded Marian exports then loop instead of emitting EOS
+    // ("Good morning everyone." → "大家早,早,早,早,早,早"). Sequential calls
+    // measured *no* slower (10 lines: 17.7s vs 17.8s batched) and are clean.
+    const translations = [];
+    for (const line of text) {
+        const single = await translator(line, merged);
+        const first = Array.isArray(single) ? single[0] : single;
+        translations.push(first?.translation_text ?? "");
+    }
     return { id, ok: true, translations };
 }
 

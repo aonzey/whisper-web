@@ -941,6 +941,24 @@ m2m100 系列（如 `Xenova/m2m100_418M`）**不认识 NLLB 的 `zho_Hans` 语�
 目标语言下拉也只列出该模型真正支持的语言，选了不支持的语言会直接给出
 「可用的目标语言：…」的提示而不是让 tokenizer 抛错。
 
+**C11. 报 `local_files_only=true ... file was not found locally at ".../models/Xenova/xxx/tokenizer.json"`**
+
+模型**没下载完整**：`.onnx` 权重在，`tokenizer.json` 却不在（以前它是"可选文件"，
+下载失败只打一行 warn，最后仍打印 `done`）。transformers.js 的 `AutoTokenizer`
+一律以 `fatal=true` 要 `tokenizer.json`，缺了就加载失败；而服务端看到权重存在
+就把该模型当成"已缓存"并关闭远程拉取，于是报出上面这个指向
+`node_modules/@xenova/transformers/models/` 的迷惑路径。
+
+```bash
+npm run fetch-model -- Xenova/opus-mt-en-zh --force   # 补齐缺失文件
+```
+
+现在三处都做了防护：`fetch-model` 下载后会校验 `config.json` / `tokenizer.json` /
+`tokenizer_config.json`，缺了就报 `FAIL` 而不是 `done`；服务端只有"权重 + tokenizer
+齐全"才进入离线模式（否则允许 transformers.js 自己去补）；Settings 里该模型会标成
+「已缓存但不完整 · 缺 …」并给出重下命令。另外 `env.localModelPath` 已指向
+`.cache`，报错信息里的路径不再指向 node_modules。
+
 **C10. Translation model 下拉里的 `Xenova/opus-mt-en-jap|ko|de|fr|es|ru` 去哪了**
 
 已全部移除：这几个权重在 transformers.js 下要么解码不出内容、要么实测不可用，

@@ -257,7 +257,32 @@ function inspectLocalModel(model) {
         fs.existsSync(localModelPath(model, "onnx/encoder_model.onnx")) &&
         fs.existsSync(localModelPath(model, "onnx/decoder_model_merged.onnx"));
     const ready = quantized || fp32;
-    return { exists: ready, quantized, fp32 };
+    return {
+        exists: ready,
+        quantized,
+        fp32,
+        ...tokenizerState(model),
+    };
+}
+
+/**
+ * Files transformers.js needs besides the weights. `AutoTokenizer` requests
+ * `tokenizer.json` with `fatal=true`, so a model without it can never load,
+ * no matter how complete the .onnx folder looks.
+ */
+const TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json"];
+
+function missingModelFiles(model, cacheDir) {
+    const dir = cacheDir ?? resolveModelDir(model).dir;
+    return TOKENIZER_FILES.filter(
+        (name) => !fs.existsSync(path.join(dir, name)),
+    );
+}
+
+/** Tokenizer side of the completeness check (see `TOKENIZER_FILES`). */
+function tokenizerState(model, cacheDir) {
+    const missingFiles = missingModelFiles(model, cacheDir);
+    return { tokenizer: missingFiles.length === 0, missingFiles };
 }
 
 /** Total size (bytes) of every file under `dir`, best effort. */
@@ -487,20 +512,30 @@ async function runLocal({ file, model, language, task, quantized }) {
     // Per model cache folder, passed per call so a concurrent translation
     // request cannot swap the directory out from under this pipeline.
     const cacheDir = resolveModelDir(model, "asr").root;
+    // Point the "local" lookup at our cache instead of the package's own
+    // `models/` folder — otherwise the error messages (and a cache miss)
+    // always talk about node_modules/@xenova/transformers/models.
+    env.localModelPath = cacheDir;
     // Allow mirrors (e.g. https://hf-mirror.com) when the default host is blocked
     env.remoteHost = HF_ENDPOINT;
 
     const weights = inspectLocalModel(model);
+    // Same rule as the translation side: only go offline when weights *and*
+    // tokenizer are present, so transformers.js can repair a partial download.
+    const complete = weights.exists && weights.tokenizer;
     const offline =
         LOCAL_OFFLINE === "1" ||
         LOCAL_OFFLINE === "true" ||
-        (LOCAL_OFFLINE === "auto" && weights.exists);
+        (LOCAL_OFFLINE === "auto" && complete);
     env.allowRemoteModels = !offline;
 
-    if (!weights.exists && offline) {
+    if (offline && !complete) {
+        const what = weights.exists
+            ? `缺少文件 ${weights.missingFiles.join("、")}`
+            : "权重文件不在缓存目录里";
         throw new Error(
-            `本地模型 ${model} 的权重不在缓存目录里。` +
-                `请先执行：npm run fetch-model -- ${model}` +
+            `本地模型 ${model} 不完整：${what}。` +
+                `请执行：npm run fetch-model -- ${model} --force` +
                 `（缓存目录 ${cacheDir}）`,
         );
     }
@@ -847,6 +882,7 @@ function inspectGenericModel(model) {
         exists: quantized || specific || fp32,
         quantized: quantized || specific,
         fp32,
+        ...tokenizerState(model),
     };
 }
 
@@ -860,15 +896,24 @@ async function runLocalTranslation({
     const cacheDir = resolveModelDir(model, "translation").root;
 
     const weights = inspectGenericModel(model);
+    // Weights *and* tokenizer must be complete before we cut off the remote
+    // host: with `allowRemoteModels=false` transformers.js cannot repair a
+    // half-downloaded model and dies with a cryptic
+    // "file was not found locally at .../models/..." error.
+    const complete = weights.exists && weights.tokenizer;
     const offline =
         LOCAL_OFFLINE === "1" ||
         LOCAL_OFFLINE === "true" ||
-        (LOCAL_OFFLINE === "auto" && weights.exists);
+        (LOCAL_OFFLINE === "auto" && complete);
 
-    if (!weights.exists && offline) {
+    if (offline && !complete) {
+        const what = weights.exists
+            ? `缺少文件 ${weights.missingFiles.join("、")}`
+            : "权重文件不在缓存目录里";
         throw new Error(
-            `本地翻译模型 ${model} 的权重不在缓存目录里。` +
-                `请先执行：npm run fetch-model -- ${model}（缓存目录 ${cacheDir}）`,
+            `本地翻译模型 ${model} 不完整：${what}。` +
+                `请执行：npm run fetch-model -- ${model} --force` +
+                `（缓存目录 ${cacheDir}）`,
         );
     }
     if (weights.exists && !weights.quantized) quantized = false;
@@ -907,7 +952,7 @@ async function runLocalTranslation({
     const text = lines.map((line) => String(line ?? "").trim());
     // A batch of 10 long sentences needs more than a single sentence, but a
     // missing-weights download must fail fast instead.
-    const timeout = weights.exists
+    const timeout = complete
         ? Math.max(TRANSLATION_TIMEOUT_MS, text.length * 20000)
         : MODEL_DOWNLOAD_TIMEOUT_MS;
 
@@ -924,12 +969,25 @@ async function runLocalTranslation({
             timeout,
         );
     } catch (error) {
-        if (!weights.exists) {
+        const raw = String(error?.message ?? error);
+        if (!complete) {
             throw new Error(
-                `无法加载翻译模型 ${model}（${error?.message ?? error}）。` +
-                    `权重不在缓存目录 ${cacheDir}，请先执行：` +
-                    `npm run fetch-model -- ${model}` +
+                `无法加载翻译模型 ${model}（${raw}）。` +
+                    (weights.exists
+                        ? `缓存目录 ${cacheDir} 里的文件不完整，缺少 ` +
+                          `${weights.missingFiles.join("、") || "未知文件"}。`
+                        : `权重不在缓存目录 ${cacheDir}。`) +
+                    `请执行：npm run fetch-model -- ${model} --force` +
                     `（huggingface.co 不可达时加 --mirror https://hf-mirror.com/）`,
+            );
+        }
+        if (raw.includes("was not found locally") && /models[/\\]/.test(raw)) {
+            // transformers.js reports the *default* localModelPath
+            // (node_modules/@xenova/transformers/models) even though we load
+            // from our own cache — spell out where the file really belongs.
+            throw new Error(
+                `${raw}\n（该模型从缓存目录 ${cacheDir} 加载；` +
+                    `若确有文件缺失，执行 npm run fetch-model -- ${model} --force 补齐）`,
             );
         }
         throw error;
@@ -1585,12 +1643,19 @@ app.get("/api/models", requireToken, (req, res) => {
     const models = cached.map((id) => {
         const info = inspectLocalModel(id);
         const generic = inspectGenericModel(id);
+        const usable = info.exists || generic.exists;
+        const missing = info.exists ? info.missingFiles : generic.missingFiles;
         return {
             id,
-            cached: info.exists || generic.exists,
+            cached: usable,
             quantized: info.quantized || generic.quantized,
             fp32: info.fp32 || generic.fp32,
             size: dirSize(resolveModelDir(id).dir),
+            // Weights present but `tokenizer.json` missing — transformers.js
+            // cannot load it at all. Surfaced so the UI can warn instead of
+            // offering a model that will fail at load time.
+            incomplete: usable && missing.length > 0,
+            missingFiles: missing,
             // "asr" (whisper family) / "translation" (opus-mt, nllb, ...) /
             // "" when the config cannot be read. Translation models also ship
             // an `encoder_model*.onnx`, so the UI needs this to tell them

@@ -173,6 +173,17 @@ const mirrors = buildMirrors();
 // Required: without generation_config.json Whisper's timestamp processor throws
 // "Array must not be empty".
 const CONFIG_REQUIRED = ["config.json", "generation_config.json"];
+/**
+ * Files transformers.js *always* asks for with `fatal=true`:
+ * `AutoTokenizer` refuses to build a tokenizer without `tokenizer.json`.
+ * If any of these is missing after the download the model is unusable, so
+ * the script must say so instead of printing a cheerful "done".
+ */
+const ESSENTIAL_FILES = [
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
 // Recommended: tokenizer / preprocessor. A miss is only a warning.
 const CONFIG_RECOMMENDED = [
     "preprocessor_config.json",
@@ -283,15 +294,29 @@ function human(bytes) {
 }
 
 async function download(url, dest) {
-    const response = await fetch(url, { redirect: "follow" });
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status} for ${url}`);
+    let lastError;
+    // One retry: a transient mirror hiccup must not leave a half-downloaded
+    // model behind (optional files used to be skipped silently, which later
+    // surfaced as "file was not found locally" at load time).
+    for (let attempt = 1; attempt <= 2; ++attempt) {
+        try {
+            const response = await fetch(url, { redirect: "follow" });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status} for ${url}`);
+            }
+            const buffer = Buffer.from(await response.arrayBuffer());
+            if (!buffer.length) throw new Error(`empty body for ${url}`);
+            await fsp.mkdir(path.dirname(dest), { recursive: true });
+            await fsp.writeFile(dest, buffer);
+            return buffer.length;
+        } catch (error) {
+            lastError = error;
+            if (attempt < 2) {
+                await new Promise((r) => setTimeout(r, 800));
+            }
+        }
     }
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (!buffer.length) throw new Error(`empty body for ${url}`);
-    await fsp.mkdir(path.dirname(dest), { recursive: true });
-    await fsp.writeFile(dest, buffer);
-    return buffer.length;
+    throw lastError;
 }
 
 async function fetchJson(url) {
@@ -634,6 +659,28 @@ async function main() {
                 failuresCount += 1;
                 console.log(
                     `  FAIL   ${task.target} :: ${error?.message ?? error}`,
+                );
+            }
+        }
+    }
+
+    // Verify, don't assume. A model that is missing `tokenizer.json` looks
+    // perfectly fine in Settings (the .onnx weights are there), but the
+    // server then marks it "cached" and disables remote fetching — and the
+    // user only sees `file was not found locally at ".../models/..."`.
+    if (!dryRun) {
+        for (const name of ESSENTIAL_FILES) {
+            if (fs.existsSync(path.join(CACHE_DIR, modelId, name))) continue;
+            if (findFile(files, name)) {
+                failuresCount += 1;
+                console.log(
+                    `  FAIL   ${name} :: 仓库里有该文件但本地缺失` +
+                        `（重新运行本命令即可补齐）`,
+                );
+            } else {
+                console.log(
+                    `  warn   ${name} :: 仓库里没有该文件，` +
+                        `transformers.js 可能无法加载这个模型`,
                 );
             }
         }

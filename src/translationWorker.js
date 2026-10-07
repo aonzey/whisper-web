@@ -111,14 +111,18 @@ self.addEventListener("message", async (event) => {
         if (tgtLang) options.tgt_lang = tgtLang;
 
         const text = (lines ?? []).map((line) => String(line ?? "").trim());
-        const output = await translator(text, {
-            ...options,
-            max_new_tokens: maxNewTokensFor(text),
-        });
-
-        const translations = (Array.isArray(output) ? output : [output]).map(
-            (item) => item?.translation_text ?? "",
-        );
+        // One call per line (same reason as the server worker): handing
+        // transformers.js an array pads the batch, and the padded Marian
+        // exports then loop instead of emitting EOS.
+        const translations = [];
+        for (const line of text) {
+            const output = await translator(line, {
+                ...options,
+                max_new_tokens: maxNewTokensFor([line]),
+            });
+            const first = Array.isArray(output) ? output[0] : output;
+            translations.push(first?.translation_text ?? "");
+        }
 
         // Some ONNX exports decode nothing but <pad>. Say so instead of
         // filling the transcript with empty lines.

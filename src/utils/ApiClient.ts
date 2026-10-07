@@ -265,6 +265,10 @@ export interface ApiModelOption {
     kind: "local" | "alias" | "remote";
     /** What the model can do: "asr" (whisper) / "translation" / "" unknown. */
     task?: string;
+    /** Weights are on disk but `tokenizer.json` is missing → cannot load. */
+    incomplete?: boolean;
+    /** Which files are missing (only set when `incomplete`). */
+    missingFiles?: string[];
 }
 
 function humanSize(bytes?: number) {
@@ -358,10 +362,18 @@ export async function fetchApiModels(
             const size = humanSize(item.size);
             options.push({
                 id: item.id,
-                note: `已缓存 · ${precision}${size ? ` · ${size}` : ""}`,
+                note: item.incomplete
+                    ? `已缓存但不完整 · 缺 ${(
+                          item.missingFiles ?? []
+                      ).join("、")} · 需重新下载`
+                    : `已缓存 · ${precision}${size ? ` · ${size}` : ""}`,
                 cached: Boolean(item.cached),
                 kind: "local",
                 task: item.task ?? "",
+                incomplete: Boolean(item.incomplete),
+                missingFiles: Array.isArray(item.missingFiles)
+                    ? item.missingFiles
+                    : undefined,
             });
         }
 
