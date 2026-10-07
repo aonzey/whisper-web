@@ -14,6 +14,7 @@ import {
     TRANSLATION_API_MODELS,
     TRANSLATION_MODELS,
     TranslationEngine,
+    TranslationModelOption,
     fixedPairLanguages,
     isBrokenTranslationModel,
     languageCodeFor,
@@ -39,6 +40,14 @@ function titleCase(str: string) {
         })
         .join("");
 }
+
+/**
+ * Model ids whose weights belong to a *translation* model. Used to tell the
+ * two browser caches apart — anything else is treated as a transcription
+ * (whisper) model.
+ */
+const MT_ID_RE =
+    /nllb|m2m|mbart|marian|opus-mt|mt5|t5|translation/i;
 
 // List of supported languages:
 // https://help.openai.com/en/articles/7031512-whisper-api-faq
@@ -1110,9 +1119,7 @@ function SettingsModal(props: {
     // Browser cache split by task, so neither column ever shows the other's
     // models as if they were its own.
     const browserAsrCached = browserCached.filter((id) => /whisper/i.test(id));
-    const browserMtCached = browserCached.filter((id) =>
-        /nllb|m2m|opus|mbart|mt5|translation/i.test(id),
-    );
+    const browserMtCached = browserCached.filter((id) => MT_ID_RE.test(id));
 
     // Model choices: server list when available, otherwise built-in aliases.
     const fallbackIds =
@@ -1156,6 +1163,21 @@ function SettingsModal(props: {
         "distil-whisper/distil-large-v2": [767],
     };
 
+    // Ids the browser-engine transcription dropdown actually offers. Used to
+    // spot a current value that matches none of them, so we can keep showing
+    // it instead of silently falling back to the first preset.
+    const browserAsrPresetIds = Object.keys(models).filter(
+        (key) =>
+            (props.transcriber.quantized ||
+                // @ts-ignore
+                models[key].length == 2) &&
+            (!props.transcriber.multilingual ||
+                !key.startsWith("distil-whisper/")),
+    );
+    const browserAsrInList =
+        browserAsrCached.includes(props.transcriber.model) ||
+        browserAsrPresetIds.includes(props.transcriber.model);
+
     const onTestApi = async () => {
         setTesting(true);
         setApiStatus("Checking...");
@@ -1193,35 +1215,48 @@ function SettingsModal(props: {
         translationEngine === "api"
             ? props.transcriber.setTranslationApiModel
             : props.transcriber.setTranslationModel;
-    // Translation column: cached weights first, then the upstream chat models
-    // (only meaningful for a third party endpoint), then the built-in presets.
-    const cachedTranslationModels = mtModels
-        .filter((option) => option.cached)
-        .filter((option) => !isBrokenTranslationModel(option.id))
-        // When the browser already holds the weights it is the faster source,
-        // so list them once, under "本浏览器已缓存".
-        .filter(
-            (option) =>
-                !(
-                    translationEngine === "browser" &&
-                    browserMtCached.includes(option.id)
-                ),
-        )
-        .map((option) => ({
-            id: option.id,
-            // The chat endpoint cannot run 🤗 weights — say so instead of
-            // silently offering an unusable model.
-            note: option.incomplete
-                ? `已缓存但不完整 · 缺 ${(
-                      option.missingFiles ?? []
-                  ).join("、")} · 需重新下载`
-                : translationEngine === "local"
-                ? "已缓存（服务端 .cache\\Translation models）"
-                : "已缓存（服务端 · 需切换到本地引擎才能用）",
-            multilingual: true,
-            size: "",
-        }));
-    const upstreamTranslationModels =
+    // Translation column. Every group below is built from **one** cache only,
+    // and an id is listed at most once (first match wins), so a model can
+    // never show up under a heading that does not own it.
+    //
+    // 1. Weights already inside this browser (Cache Storage).
+    const browserMtOptions: TranslationModelOption[] =
+        translationEngine === "browser"
+            ? browserMtCached
+                  .filter((id) => !isBrokenTranslationModel(id))
+                  .map((id) => ({
+                      id,
+                      note: "本浏览器已缓存 · 直接用",
+                      multilingual: true,
+                      size: "",
+                  }))
+            : [];
+    //
+    // 2. Weights the server holds under `.cache\Translation models`.
+    //    Deliberately empty for the browser engine: that is a different
+    //    cache, and listing it there made it look as if the browser already
+    //    had the weights (and produced a bogus "当前值（不在列表中）" row).
+    const serverMtOptions: TranslationModelOption[] =
+        translationEngine === "browser"
+            ? []
+            : mtModels
+                  .filter((option) => option.cached)
+                  .filter((option) => !isBrokenTranslationModel(option.id))
+                  .map((option) => ({
+                      id: option.id,
+                      note: option.incomplete
+                          ? `已缓存但不完整 · 缺 ${(
+                                option.missingFiles ?? []
+                            ).join("、")} · 需重新下载`
+                          : translationEngine === "local"
+                          ? "服务端已缓存 · 本地引擎直接用"
+                          : "服务端已缓存 · 聊天引擎用不到，切到本地引擎才可用",
+                      multilingual: true,
+                      size: "",
+                  }));
+    //
+    // 3. Chat models advertised by a third-party endpoint.
+    const upstreamTranslationModels: TranslationModelOption[] =
         translationApiTarget.kind === "openai"
             ? mtModels
                   .filter((option) => !option.cached)
@@ -1233,37 +1268,45 @@ function SettingsModal(props: {
                       size: "",
                   }))
             : [];
-    const presetTranslationModels = (
+    //
+    // 4. Built-in presets (downloaded on first use).
+    const presetTranslationModels: TranslationModelOption[] = (
         translationEngine === "api"
             ? TRANSLATION_API_MODELS.map((id) => ({
                   id,
-                  note: "聊天模型",
+                  note: "内置聊天模型",
                   multilingual: true,
                   size: "",
               }))
-            : TRANSLATION_MODELS
-    ).filter(
-        (option) =>
-            !cachedTranslationModels.some(
-                (cached) => cached.id === option.id,
-            ) &&
-            !upstreamTranslationModels.some(
-                (remote) => remote.id === option.id,
-            ) &&
-            // Already listed under "本浏览器已缓存" — do not show it twice.
-            !(
-                translationEngine === "browser" &&
-                browserMtCached.includes(option.id)
-            ),
-    );
-    const translationModelOptions = [
-        ...cachedTranslationModels,
-        ...upstreamTranslationModels,
-        ...presetTranslationModels,
-    ];
-    const translationModelList = translationModelOptions.map(
-        (option) => option.id,
-    );
+            : TRANSLATION_MODELS.map((option) => ({
+                  id: option.id,
+                  note:
+                      translationEngine === "browser"
+                          ? `${option.note} · 首次使用会下载到本浏览器`
+                          : option.note,
+                  multilingual: option.multilingual,
+                  size: option.size,
+              }))
+    ).filter((option) => !isBrokenTranslationModel(option.id));
+
+    // First match wins, so the same id is never offered by two groups.
+    const seenMtIds = new Set<string>();
+    const takeOnce = (options: TranslationModelOption[]) =>
+        options.filter((option) => {
+            if (seenMtIds.has(option.id)) return false;
+            seenMtIds.add(option.id);
+            return true;
+        });
+    const browserMtGroup = takeOnce(browserMtOptions);
+    const serverMtGroup = takeOnce(serverMtOptions);
+    const upstreamMtGroup = takeOnce(upstreamTranslationModels);
+    const presetMtGroup = takeOnce(presetTranslationModels);
+    const translationModelList = [
+        ...browserMtGroup,
+        ...serverMtGroup,
+        ...upstreamMtGroup,
+        ...presetMtGroup,
+    ].map((option) => option.id);
     const translationModelInList = translationModelList.includes(
         currentTranslationModel,
     );
@@ -1278,14 +1321,14 @@ function SettingsModal(props: {
     const serverCacheLabel =
         translationEngine === "local"
             ? "服务端已缓存（.cache\\Translation models · 本地引擎直接用）"
-            : translationEngine === "browser"
-            ? "服务端已缓存（.cache\\Translation models · 经本地服务端的 /models 拉到浏览器）"
             : "服务端已缓存（本地引擎权重 · 聊天引擎用不到，切到本地引擎才可用）";
     const browserCacheLabel = "本浏览器已缓存（浏览器引擎可直接用）";
     const presetLabel =
         translationEngine === "api"
             ? "内置聊天模型"
-            : "🤗 翻译模型预设（首次使用会下载）";
+            : translationEngine === "browser"
+            ? "🤗 翻译模型预设（首次使用会下载到本浏览器）"
+            : "🤗 翻译模型预设（首次使用会下载到服务端）";
 
     // Which languages the selected model can actually produce. nllb wants
     // `zho_Hans` style codes, m2m100 plain `zh`, opus-mt-* a single language.
@@ -1468,8 +1511,9 @@ function SettingsModal(props: {
                                     >
                                         {!currentInList && (
                                             <option value={currentModel}>
-                                                {currentModel || "(未选择)"}
-                                                {" — 当前值（不在列表中）"}
+                                                {currentModel
+                                                    ? `${currentModel} — 当前值（手动填写，不在下面的分组里）`
+                                                    : "（未选择）"}
                                             </option>
                                         )}
                                         <optgroup
@@ -1531,16 +1575,25 @@ function SettingsModal(props: {
                         ) : (
                             <>
                                 <label>Select the model to use.</label>
-                                <select
-                                    className='mt-1 mb-1 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
-                                    defaultValue={props.transcriber.model}
-                                    onChange={(e) => {
-                                        props.transcriber.setModel(
-                                            e.target.value,
-                                        );
-                                    }}
-                                >
-                                    {browserAsrCached.length > 0 && (
+                                    <select
+                                        className='mt-1 mb-1 bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 dark:bg-gray-700 dark:border-gray-600 dark:placeholder-gray-400 dark:text-white dark:focus:ring-blue-500 dark:focus:border-blue-500'
+                                        value={props.transcriber.model}
+                                        onChange={(e) => {
+                                            props.transcriber.setModel(
+                                                e.target.value,
+                                            );
+                                        }}
+                                    >
+                                        {!browserAsrInList && (
+                                            <option
+                                                value={props.transcriber.model}
+                                            >
+                                                {props.transcriber.model ||
+                                                    "(未选择)"}
+                                                {" — 当前值（不在下面的分组里）"}
+                                            </option>
+                                        )}
+                                        {browserAsrCached.length > 0 && (
                                         <optgroup label='本浏览器已缓存（浏览器引擎可直接用）'>
                                             {browserAsrCached.map((id) => (
                                                 <option key={id} value={id}>
@@ -1842,68 +1895,65 @@ function SettingsModal(props: {
                             >
                                 {!translationModelInList && (
                                     <option value={currentTranslationModel}>
-                                        {currentTranslationModel || "(未选择)"}
-                                        {" — 当前值（不在列表中）"}
+                                        {currentTranslationModel
+                                            ? `${currentTranslationModel} — 当前值（手动填写，不在下面的分组里）`
+                                            : "（未选择）"}
                                     </option>
                                 )}
-                                {translationEngine === "browser" &&
-                                    browserMtCached.length > 0 && (
-                                        <optgroup label={browserCacheLabel}>
-                                            {browserMtCached.map((id) => (
-                                                <option key={id} value={id}>
-                                                    {id} — 已在浏览器内
-                                                </option>
-                                            ))}
-                                        </optgroup>
-                                    )}
-                                {cachedTranslationModels.length > 0 && (
+                                {browserMtGroup.length > 0 && (
+                                    <optgroup label={browserCacheLabel}>
+                                        {browserMtGroup.map((option) => (
+                                            <option
+                                                key={option.id}
+                                                value={option.id}
+                                            >
+                                                {option.id} · {option.note}
+                                            </option>
+                                        ))}
+                                    </optgroup>
+                                )}
+                                {serverMtGroup.length > 0 && (
                                     <optgroup label={serverCacheLabel}>
-                                        {cachedTranslationModels.map(
-                                            (option) => (
-                                                <option
-                                                    key={option.id}
-                                                    value={option.id}
-                                                >
-                                                    {option.id}
-                                                    {option.size
-                                                        ? ` — ${option.size}`
-                                                        : ""}{" "}
-                                                    · {option.note}
-                                                </option>
-                                            ),
-                                        )}
+                                        {serverMtGroup.map((option) => (
+                                            <option
+                                                key={option.id}
+                                                value={option.id}
+                                            >
+                                                {option.id}
+                                                {option.size
+                                                    ? ` — ${option.size}`
+                                                    : ""}{" "}
+                                                · {option.note}
+                                            </option>
+                                        ))}
                                     </optgroup>
                                 )}
-                                {upstreamTranslationModels.length > 0 && (
+                                {upstreamMtGroup.length > 0 && (
                                     <optgroup label='上游聊天模型（第三方端点）'>
-                                        {upstreamTranslationModels.map(
-                                            (option) => (
-                                                <option
-                                                    key={option.id}
-                                                    value={option.id}
-                                                >
-                                                    {option.id}
-                                                </option>
-                                            ),
-                                        )}
+                                        {upstreamMtGroup.map((option) => (
+                                            <option
+                                                key={option.id}
+                                                value={option.id}
+                                            >
+                                                {option.id}
+                                            </option>
+                                        ))}
                                     </optgroup>
                                 )}
-                                {presetTranslationModels.length > 0 && (
+                                {presetMtGroup.length > 0 && (
                                     <optgroup label={presetLabel}>
-                                        {presetTranslationModels.map(
-                                            (option) => (
-                                                <option
-                                                    key={option.id}
-                                                    value={option.id}
-                                                >
-                                                    {option.id}
-                                                    {option.size
-                                                        ? ` — ${option.size}`
-                                                        : ""}{" "}
-                                                    · {option.note}
-                                                </option>
-                                            ),
-                                        )}
+                                        {presetMtGroup.map((option) => (
+                                            <option
+                                                key={option.id}
+                                                value={option.id}
+                                            >
+                                                {option.id}
+                                                {option.size
+                                                    ? ` — ${option.size}`
+                                                    : ""}{" "}
+                                                · {option.note}
+                                            </option>
+                                        ))}
                                     </optgroup>
                                 )}
                             </select>
@@ -1936,12 +1986,14 @@ function SettingsModal(props: {
                         )}
                         {translationEngine === "browser" && (
                             <p className='text-xs text-slate-400 mb-2 break-all'>
-                                本浏览器已缓存的翻译模型（Cache Storage）：
+                                浏览器引擎的模型只来自这一处：本浏览器的 Cache
+                                Storage（
                                 {browserMtCached.length
                                     ? browserMtCached.join("、")
-                                    : "无，首次使用会自动下载到浏览器"}
-                                。这与服务端 .cache\Translation models
-                                是两份独立的缓存，上面已分开列出。
+                                    : "暂无，选中预设后首次使用会自动下载"}
+                                ）。服务端 .cache\Translation models
+                                是另一份独立缓存，这里不会列出——要在服务端跑请切到
+                                Local engine，或点「手动输入」直接填模型 id。
                             </p>
                         )}
 
