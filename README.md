@@ -114,6 +114,33 @@ npm run server       # API 会顺带托管 dist/，直接访问 http://localhost
 选完文件后，文件会以**队列**形式列在页面上：点击可切换查看某个文件的结果，
 每项显示时长与状态（待转写 / 转写中 / 完成 / 失败），可单独删除。
 
+#### Record（录音）为什么有时不显示？
+
+`navigator.mediaDevices`（麦克风）只在**安全上下文**里存在：https，或
+`localhost` / `127.0.0.1`。用局域网 IP 加 http 打开（例如
+`http://192.168.66.109:8787`）时它不是安全上下文，浏览器直接不提供麦克风接口，
+所以 Record 一项会被隐藏——页面顶部会显示一行黄色提示说明原因。
+
+三种解法：
+
+1. **本机使用**：直接访问 `http://localhost:8787`（最快）。
+2. **局域网 / 手机访问**：让服务端同时提供 HTTPS。放一份证书到 `certs/` 即可
+   （自签就行，浏览器警告点一次「继续」即可），服务端会额外监听 `PORT+1`：
+
+   ```bash
+   openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+     -keyout certs/server.key -out certs/server.crt \
+     -subj "/CN=192.168.66.109" \
+     -addext "subjectAltName=IP:192.168.66.109,DNS:localhost"
+   npm run server          # http://...:8787 + https://...:8788
+   ```
+
+   证书路径可用 `HTTPS_KEY` / `HTTPS_CERT` 指定，端口用 `HTTPS_PORT`。
+   没有证书时服务端行为不变（只监听 http）。
+3. **临时验证**：Chrome 打开
+   `chrome://flags/#unsafely-treat-insecure-origin-as-secure`，填入
+   `http://192.168.66.109:8787` 并重启浏览器。
+
 ### 2. 三种转写引擎（该怎么选）
 
 | 引擎 | 模型跑在哪 | 优点 | 缺点 | 适用场景 |

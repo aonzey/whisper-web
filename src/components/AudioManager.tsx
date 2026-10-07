@@ -612,6 +612,12 @@ export function AudioManager(props: {
         : transcribeProgress?.value;
 
     const translateProgress = props.transcriber.translationProgress;
+    // `navigator.mediaDevices` only exists in a secure context (https, or
+    // localhost / 127.0.0.1). On a plain-http LAN address (e.g.
+    // http://192.168.x.x:8787) it is undefined, which used to make the
+    // Record tile vanish without any explanation.
+    const canRecord =
+        typeof navigator !== "undefined" && Boolean(navigator.mediaDevices);
     const translationProgressValue =
         translateProgress && translateProgress.total > 0
             ? translateProgress.done / translateProgress.total
@@ -658,7 +664,7 @@ export function AudioManager(props: {
                             handleFiles(files);
                         }}
                     />
-                    {navigator.mediaDevices && (
+                    {canRecord && (
                         <>
                             <VerticalBar />
                             <RecordTile
@@ -682,6 +688,18 @@ export function AudioManager(props: {
                         </>
                     )}
                 </div>
+                {!canRecord && (
+                    <p className='w-full px-3 pb-2 text-xs text-amber-600 leading-snug'>
+                        Record 不可用：<code>navigator.mediaDevices</code>{" "}
+                        只在安全上下文里存在（https，或 localhost /
+                        127.0.0.1）。当前是 http 且非 localhost，浏览器不提供麦克风。
+                        解决：① 在本机用{" "}
+                        <code>http://localhost:8787</code>；② 需要局域网/手机访问就配
+                        HTTPS；③ 临时办法：Chrome 打开{" "}
+                        <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>
+                        ，填入 <code>{location.origin}</code> 并重启浏览器。
+                    </p>
+                )}
                 {
                     <AudioDataBar
                         progress={isAudioLoading ? progress : +!!audioData}

@@ -1827,6 +1827,47 @@ if (fs.existsSync(distPath)) {
     });
 }
 
+/**
+ * Optional HTTPS listener.
+ *
+ * `navigator.mediaDevices` — and therefore the Record button — only exists in
+ * a secure context (https, or localhost / 127.0.0.1). Opening the app over
+ * plain http on a LAN address (http://192.168.x.x:8787) silently hides the
+ * microphone. Put a certificate in `certs/server.key` + `certs/server.crt`
+ * (or point `HTTPS_KEY` / `HTTPS_CERT` elsewhere) to also serve https; a
+ * self-signed one is enough, the browser warning can be accepted once.
+ *
+ *   openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+ *     -keyout certs/server.key -out certs/server.crt -subj "/CN=192.168.66.109"
+ */
+async function startHttps() {
+    const keyPath =
+        process.env.HTTPS_KEY || path.join(process.cwd(), "certs", "server.key");
+    const certPath =
+        process.env.HTTPS_CERT ||
+        path.join(process.cwd(), "certs", "server.crt");
+    if (!fs.existsSync(keyPath) || !fs.existsSync(certPath)) return;
+    try {
+        const { createServer } = await import("node:https");
+        const server = createServer(
+            {
+                key: fs.readFileSync(keyPath),
+                cert: fs.readFileSync(certPath),
+            },
+            app,
+        );
+        const port = Number(process.env.HTTPS_PORT || PORT + 1);
+        server.listen(port, () => {
+            console.log(
+                `  https  : https://localhost:${port}  ` +
+                    `（安全上下文，Record / 麦克风可用）`,
+            );
+        });
+    } catch (error) {
+        console.warn(`[warn] HTTPS 启动失败：${error?.message ?? error}`);
+    }
+}
+
 app.listen(PORT, () => {
     console.log(`whisper-web API listening on http://localhost:${PORT}`);
     console.log(
@@ -1844,4 +1885,5 @@ app.listen(PORT, () => {
             ? `  local  : ready (${cached.join(", ")})`
             : `  local  : 未下载权重，运行 "npm run fetch-model" 后可用`,
     );
+    void startHttps();
 });
